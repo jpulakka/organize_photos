@@ -131,6 +131,7 @@ class HashCache:
         self._con.executescript(self.SCHEMA)
         self._con.commit()
         self._pending: list[tuple] = []   # rows to batch-write
+        self._pending_updates: int = 0
 
     # ── read ─────────────────────────────────────────────────────────────────────
 
@@ -167,14 +168,14 @@ class HashCache:
             (ph, str(path), size, mtime_ns),
         )
         # Don't commit immediately — will be flushed in next batch or close
-        self._pending_updates = getattr(self, "_pending_updates", 0) + 1
+        self._pending_updates += 1
         if self._pending_updates >= CACHE_BATCH:
             self._con.commit()
             self._pending_updates = 0
 
     def close(self):
         self.flush()
-        if getattr(self, "_pending_updates", 0):
+        if self._pending_updates:
             self._con.commit()
         self._con.close()
 
@@ -194,18 +195,18 @@ def exif_date(path: Path) -> "datetime | None":
     try:
         from PIL import Image
         from PIL.ExifTags import TAGS
-        img = Image.open(path)
-        exif_data = img._getexif()
-        if not exif_data:
-            return None
-        tag_map = {v: k for k, v in TAGS.items()}
-        for tag_name in ("DateTimeOriginal", "DateTime"):
-            tag_id = tag_map.get(tag_name)
-            if tag_id and tag_id in exif_data:
-                try:
-                    return datetime.strptime(exif_data[tag_id], "%Y:%m:%d %H:%M:%S")
-                except ValueError:
-                    pass
+        with Image.open(path) as img:
+            exif_data = img.getexif()
+            if not exif_data:
+                return None
+            tag_map = {v: k for k, v in TAGS.items()}
+            for tag_name in ("DateTimeOriginal", "DateTime"):
+                tag_id = tag_map.get(tag_name)
+                if tag_id and tag_id in exif_data:
+                    try:
+                        return datetime.strptime(exif_data[tag_id], "%Y:%m:%d %H:%M:%S")
+                    except ValueError:
+                        pass
     except Exception:
         pass
     return None
@@ -259,7 +260,8 @@ def _compute_phash(path_str: str) -> "tuple[str, str | None]":
     try:
         import imagehash
         from PIL import Image
-        ph = imagehash.phash(Image.open(path_str))
+        with Image.open(path_str) as img:
+            ph = imagehash.phash(img)
         return path_str, str(ph)          # imagehash hashes are str-serialisable
     except Exception:
         return path_str, None
@@ -357,7 +359,13 @@ def batch_sha256(
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_compute_sha256, str(r.path)): r for r in need}
         for fut in as_completed(futures):
-            path_str, digest = fut.result()
+            try:
+                path_str, digest = fut.result()
+            except Exception as exc:
+                r = futures[fut]
+                print(f"\n  WARNING: SHA-256 failed for {r.path}: {exc}", flush=True)
+                bar.update()
+                continue
             r = path_to_record[path_str]
             r.exact_hash = digest
             # Write to cache (phash unknown yet — will be filled in batch_phash)
@@ -401,11 +409,17 @@ def batch_phash(
     with ProcessPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_compute_phash, str(r.path)): r for r in need}
         for fut in as_completed(futures):
-            path_str, ph_str = fut.result()
+            try:
+                path_str, ph_str = fut.result()
+            except Exception as exc:
+                r = futures[fut]
+                print(f"\n  WARNING: pHash failed for {r.path}: {exc}", flush=True)
+                bar.update()
+                continue
             r = path_to_record[path_str]
             r.phash_str = ph_str
-            if r.exact_hash:   # should always be true at this point
-                cache.update_phash(r.path, r.size, r.mtime_ns, ph_str or "")
+            if r.exact_hash and ph_str:
+                cache.update_phash(r.path, r.size, r.mtime_ns, ph_str)
             bar.update()
 
     bar.close()
@@ -591,11 +605,12 @@ def plan(
     phash_threshold: int,
     sha_workers: int,
     phash_workers: int,
+    extensions: "set[str]",
 ) -> "tuple[list, list]":
 
     all_files = sorted(
         p for p in src.rglob("*")
-        if p.is_file() and p.suffix.lower() in ALL_EXTENSIONS
+        if p.is_file() and p.suffix.lower() in extensions
     )
     print(f"  Found {len(all_files)} media files in source.")
 
@@ -629,7 +644,7 @@ def plan(
 def write_dup_log(dst: Path, dup_pairs: list) -> None:
     log_path = dst / "duplicates.log"
     dst.mkdir(parents=True, exist_ok=True)
-    with open(log_path, "w") as f:
+    with open(log_path, "w", encoding="utf-8") as f:
         f.write(f"# Duplicate report — {datetime.now():%Y-%m-%d %H:%M:%S}\n")
         f.write(f"# {len(dup_pairs)} file(s) skipped as duplicates\n\n")
         for kept, skipped in dup_pairs:
@@ -642,6 +657,7 @@ def run(moves: list, dup_pairs: list, dst: Path, mode: str, dry_run: bool) -> No
     total = len(moves)
     pad = len(str(total))
     counters: dict = {"exif": 0, "filename": 0, "mtime": 0}
+    failures = 0
 
     print()
     for i, (r, dst_file) in enumerate(moves, 1):
@@ -650,13 +666,17 @@ def run(moves: list, dup_pairs: list, dst: Path, mode: str, dry_run: bool) -> No
         if dry_run:
             print(f"  DRY  {label}  {r.path}  ->  {dst_file}")
         else:
-            dst_file.parent.mkdir(parents=True, exist_ok=True)
-            if mode == "move":
-                shutil.move(str(r.path), dst_file)
-            else:
-                shutil.copy2(str(r.path), dst_file)
-            verb = "MOVE" if mode == "move" else "COPY"
-            print(f"  {verb} {label}  {r.path.name}  ->  {dst_file}")
+            try:
+                dst_file.parent.mkdir(parents=True, exist_ok=True)
+                if mode == "move":
+                    shutil.move(str(r.path), dst_file)
+                else:
+                    shutil.copy2(str(r.path), dst_file)
+                verb = "MOVE" if mode == "move" else "COPY"
+                print(f"  {verb} {label}  {r.path.name}  ->  {dst_file}")
+            except Exception as exc:
+                print(f"  FAIL {label}  {r.path.name}: {exc}")
+                failures += 1
 
     if not dry_run and dup_pairs:
         write_dup_log(dst, dup_pairs)
@@ -668,6 +688,8 @@ def run(moves: list, dup_pairs: list, dst: Path, mode: str, dry_run: bool) -> No
     print(f"  ├ EXIF date      : {counters.get('exif', 0)}")
     print(f"  ├ Filename date  : {counters.get('filename', 0)}")
     print(f"  └ Mtime only     : {counters.get('mtime', 0)}")
+    if failures:
+        print(f"  Errors           : {failures} file(s) failed to {mode}")
     if dry_run:
         print()
         print("  ⚠  DRY RUN — nothing was changed.")
@@ -712,6 +734,13 @@ def main():
                         help="Override extensions (e.g. .jpg .png .heic)")
     args = parser.parse_args()
 
+    if not (0 <= args.phash_threshold <= 64):
+        parser.error("--phash-threshold must be in range 0-64")
+    if args.sha_workers < 1:
+        parser.error("--sha-workers must be >= 1")
+    if args.phash_workers < 1:
+        parser.error("--phash-workers must be >= 1")
+
     src = Path(args.src).expanduser().resolve()
     dst = Path(args.dst).expanduser().resolve()
 
@@ -719,9 +748,10 @@ def main():
         print(f"ERROR: source not found: {src}", file=sys.stderr)
         sys.exit(1)
 
-    if args.extensions:
-        global ALL_EXTENSIONS
-        ALL_EXTENSIONS = {e if e.startswith(".") else f".{e}" for e in args.extensions}
+    extensions = (
+        {e if e.startswith(".") else f".{e}" for e in args.extensions}
+        if args.extensions else ALL_EXTENSIONS
+    )
 
     dry_run = not (args.move or args.copy)
     mode    = "move" if args.move else "copy"
@@ -748,6 +778,7 @@ def main():
             phash_threshold = args.phash_threshold,
             sha_workers     = args.sha_workers,
             phash_workers   = args.phash_workers,
+            extensions      = extensions,
         )
     finally:
         cache.close()
