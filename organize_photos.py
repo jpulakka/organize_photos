@@ -616,7 +616,7 @@ def plan(
     sha_workers: int,
     phash_workers: int,
     extensions: "set[str]",
-) -> "tuple[list, list]":
+) -> "tuple[list, list, int]":
 
     all_files = sorted(
         p for p in src.rglob("*")
@@ -630,8 +630,11 @@ def plan(
         records, cache, exact_only, phash_threshold, sha_workers, phash_workers,
     )
 
+    skipped_unknown = 0
     if skip_unknown:
+        before = len(keepers)
         keepers = [r for r in keepers if r.date_source != "mtime"]
+        skipped_unknown = before - len(keepers)
 
     seen_destinations: set = set()
     moves = []
@@ -644,7 +647,7 @@ def plan(
         seen_destinations.add(dest)
         moves.append((r, dest))
 
-    return moves, dup_pairs
+    return moves, dup_pairs, skipped_unknown
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -666,7 +669,13 @@ def _safe_move(src_path: Path, dst_file: Path, expected_hash: "str | None") -> N
     except OSError:
         pass                                        # cross-device — copy + verify
 
-    shutil.copy2(str(src_path), dst_file)
+    try:
+        shutil.copy2(str(src_path), dst_file)
+    except BaseException:
+        # Remove partial/corrupt destination so it doesn't confuse future runs
+        if dst_file.exists():
+            dst_file.unlink()
+        raise
 
     if expected_hash:
         h = hashlib.sha256()
@@ -695,7 +704,8 @@ def write_dup_log(dst: Path, dup_pairs: list) -> None:
     print(f"  Duplicate log written: {log_path}")
 
 
-def run(moves: list, dup_pairs: list, dst: Path, mode: str, dry_run: bool) -> None:
+def run(moves: list, dup_pairs: list, dst: Path, mode: str, dry_run: bool,
+        skipped_unknown: int = 0) -> None:
     total = len(moves)
     pad = len(str(total))
     counters: dict = {"exif": 0, "filename": 0, "mtime": 0}
@@ -721,12 +731,17 @@ def run(moves: list, dup_pairs: list, dst: Path, mode: str, dry_run: bool) -> No
                 failures += 1
 
     if not dry_run and dup_pairs:
-        write_dup_log(dst, dup_pairs)
+        try:
+            write_dup_log(dst, dup_pairs)
+        except Exception as exc:
+            print(f"  WARNING: could not write duplicate log: {exc}")
 
     print()
     print("── Summary ─────────────────────────────────────────────")
     print(f"  Files kept       : {total}")
     print(f"  Duplicates skip  : {len(dup_pairs)}")
+    if skipped_unknown:
+        print(f"  Unknown date skip: {skipped_unknown} (--skip-unknown)")
     print(f"  ├ EXIF date      : {counters.get('exif', 0)}")
     print(f"  ├ Filename date  : {counters.get('filename', 0)}")
     print(f"  └ Mtime only     : {counters.get('mtime', 0)}")
@@ -837,7 +852,7 @@ def main():
         cache.clear()
 
     try:
-        moves, dup_pairs = plan(
+        moves, dup_pairs, skipped_unknown = plan(
             src, dst, cache,
             skip_unknown    = args.skip_unknown,
             exact_only      = args.exact_only,
@@ -853,7 +868,8 @@ def main():
         print("No files to process.")
         return
 
-    run(moves, dup_pairs, dst, mode=mode, dry_run=dry_run)
+    run(moves, dup_pairs, dst, mode=mode, dry_run=dry_run,
+        skipped_unknown=skipped_unknown)
 
 
 if __name__ == "__main__":
