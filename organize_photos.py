@@ -58,7 +58,6 @@ Dependencies:
 import argparse
 import hashlib
 import multiprocessing
-import os
 import re
 import shutil
 import sqlite3
@@ -194,19 +193,26 @@ def exif_date(path: Path) -> "datetime | None":
         return None
     try:
         from PIL import Image
-        from PIL.ExifTags import TAGS
         with Image.open(path) as img:
-            exif_data = img.getexif()
-            if not exif_data:
+            exif = img.getexif()
+            if not exif:
                 return None
-            tag_map = {v: k for k, v in TAGS.items()}
-            for tag_name in ("DateTimeOriginal", "DateTime"):
-                tag_id = tag_map.get(tag_name)
-                if tag_id and tag_id in exif_data:
+            # DateTimeOriginal (36867) and DateTimeDigitized (36868) live in
+            # the EXIF sub-IFD (0x8769), not in IFD0.  DateTime (306) is IFD0.
+            exif_ifd = exif.get_ifd(0x8769)
+            for tag_id in (36867, 36868):          # DateTimeOriginal, DateTimeDigitized
+                val = exif_ifd.get(tag_id)
+                if val:
                     try:
-                        return datetime.strptime(exif_data[tag_id], "%Y:%m:%d %H:%M:%S")
-                    except ValueError:
+                        return datetime.strptime(val, "%Y:%m:%d %H:%M:%S")
+                    except (ValueError, TypeError):
                         pass
+            val = exif.get(306)                     # DateTime (IFD0)
+            if val:
+                try:
+                    return datetime.strptime(val, "%Y:%m:%d %H:%M:%S")
+                except (ValueError, TypeError):
+                    pass
     except Exception:
         pass
     return None
@@ -337,15 +343,14 @@ def batch_sha256(
     workers: int,
 ) -> None:
     """Fill record.exact_hash for every record, using cache + parallel threads."""
-    need = [r for r in records
-            if cache.get(r.path, r.size, r.mtime_ns)[0] is None]
-    cached_count = len(records) - len(need)
-
-    # Populate from cache first
+    need = []
     for r in records:
         cached_sha, _ = cache.get(r.path, r.size, r.mtime_ns)
         if cached_sha:
             r.exact_hash = cached_sha
+        else:
+            need.append(r)
+    cached_count = len(records) - len(need)
 
     if not need:
         print(f"  SHA-256: all {len(records)} served from cache.")
@@ -507,11 +512,15 @@ def find_duplicates(
     batch_sha256(records, cache, sha_workers)
 
     by_hash: dict = defaultdict(list)
+    unhashed = []
     for r in records:
-        by_hash[r.exact_hash or ""].append(r)
+        if r.exact_hash:
+            by_hash[r.exact_hash].append(r)
+        else:
+            unhashed.append(r)
 
     dup_pairs = []
-    after_exact = []
+    after_exact = list(unhashed)  # can't dedup without a hash — keep them all
     exact_dup_count = 0
     for group in by_hash.values():
         keeper = best_in_group(group)
@@ -584,14 +593,14 @@ def find_duplicates(
 # ════════════════════════════════════════════════════════════════════════════════
 
 def safe_destination(dst_file: Path, seen: set) -> Path:
-    if dst_file not in seen:
+    if dst_file not in seen and not dst_file.exists():
         return dst_file
     stem, suffix = dst_file.stem, dst_file.suffix
     parent = dst_file.parent
     counter = 1
     while True:
         candidate = parent / f"{stem}_{counter}{suffix}"
-        if candidate not in seen:
+        if candidate not in seen and not candidate.exists():
             return candidate
         counter += 1
 
