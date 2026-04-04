@@ -182,3 +182,9 @@ cython_debug/
 
 # Claude Code
 .claude/
+
+# venv
+Include/
+Lib/
+Scripts/
+pyvenv.cfg
