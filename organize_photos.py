@@ -672,9 +672,14 @@ def _safe_move(src_path: Path, dst_file: Path, expected_hash: "str | None") -> N
     try:
         shutil.copy2(str(src_path), dst_file)
     except BaseException:
-        # Remove partial/corrupt destination so it doesn't confuse future runs
-        if dst_file.exists():
-            dst_file.unlink()
+        # Remove partial/corrupt destination so it doesn't confuse future runs.
+        # Cleanup errors must not suppress the original exception (especially
+        # KeyboardInterrupt), so swallow any OSError from the unlink.
+        try:
+            if dst_file.exists():
+                dst_file.unlink()
+        except OSError:
+            pass
         raise
 
     if expected_hash:
