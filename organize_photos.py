@@ -704,14 +704,18 @@ def _safe_move(src_path: Path, dst_file: Path, expected_hash: "str | None") -> N
     src_path.unlink()
 
 
-def write_dup_log(dst: Path, dup_pairs: list) -> None:
+def write_dup_log(dst: Path, dup_pairs: list, moved_to: "dict[Path, Path] | None" = None) -> None:
     log_path = dst / "duplicates.log"
     dst.mkdir(parents=True, exist_ok=True)
     with open(log_path, "w", encoding="utf-8") as f:
         f.write(f"# Duplicate report — {datetime.now():%Y-%m-%d %H:%M:%S}\n")
         f.write(f"# {len(dup_pairs)} file(s) skipped as duplicates\n\n")
         for kept, skipped in dup_pairs:
-            f.write(f"KEPT    {kept.path}\n")
+            dest = moved_to.get(kept.path) if moved_to else None
+            if dest:
+                f.write(f"KEPT    {dest}  (from {kept.path})\n")
+            else:
+                f.write(f"KEPT    {kept.path}\n")
             f.write(f"SKIP    {skipped.path}\n\n")
     print(f"  Duplicate log written: {log_path}")
 
@@ -744,7 +748,8 @@ def run(moves: list, dup_pairs: list, dst: Path, mode: str, dry_run: bool,
 
     if not dry_run and dup_pairs:
         try:
-            write_dup_log(dst, dup_pairs)
+            moved_to = {r.path: dst_file for r, dst_file in moves} if mode == "move" else None
+            write_dup_log(dst, dup_pairs, moved_to)
         except Exception as exc:
             print(f"  WARNING: could not write duplicate log: {exc}")
 
