@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-organize_photos.py — Sort photos into YYYY/YYYY-MM/ directories by date,
-                     with duplicate detection, parallel hashing, and a
-                     persistent hash cache so repeat runs are near-instant.
+organize_photos.py — Sort photos into YYYY/ (or YYYY/YYYY-MM/ with
+                     --by-month) directories by date, with duplicate
+                     detection, parallel hashing, and a persistent hash
+                     cache so repeat runs are near-instant.
 
 Date resolution priority:
   1. EXIF DateTimeOriginal  (most accurate — when the shutter fired)
@@ -33,6 +34,9 @@ Usage:
 
   # Move:
   python organize_photos.py --src /path/to/messy --dst /path/to/sorted --move
+
+  # Organise into YYYY/YYYY-MM/ instead of the default YYYY/:
+  python organize_photos.py --src /path/to/messy --dst /path/to/sorted --copy --by-month
 
   # Exact-only dedup (no imagehash needed, faster):
   python organize_photos.py --src /path/to/messy --dst /path/to/sorted --copy --exact-only
@@ -616,6 +620,7 @@ def plan(
     sha_workers: int,
     phash_workers: int,
     extensions: "set[str]",
+    by_month: bool = False,
 ) -> "tuple[list, list, int]":
 
     all_files = sorted(
@@ -641,8 +646,10 @@ def plan(
     for r in sorted(keepers, key=lambda r: r.path):
         if r.date_source == "mtime":
             folder = dst / "_unknown" / r.path.relative_to(src).parent
-        else:
+        elif by_month:
             folder = dst / str(r.dt.year) / r.dt.strftime("%Y-%m")
+        else:
+            folder = dst / str(r.dt.year)
         dest = safe_destination(folder / r.path.name, seen_destinations)
         seen_destinations.add(dest)
         moves.append((r, dest))
@@ -771,7 +778,7 @@ def main():
     cpu_count = multiprocessing.cpu_count()
 
     parser = argparse.ArgumentParser(
-        description="Organise photos into YYYY/YYYY-MM/ dirs, deduplicated.",
+        description="Organise photos into YYYY/ dirs (or YYYY/YYYY-MM/ with --by-month), deduplicated.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -782,6 +789,8 @@ def main():
     g.add_argument("--move", action="store_true", help="Move files")
     g.add_argument("--copy", action="store_true", help="Copy files (originals untouched)")
 
+    parser.add_argument("--by-month",         action="store_true",
+                        help="Organise into YYYY/YYYY-MM/ instead of the default YYYY/")
     parser.add_argument("--skip-unknown",    action="store_true",
                         help="Skip files whose date falls back to mtime")
     parser.add_argument("--exact-only",      action="store_true",
@@ -843,10 +852,12 @@ def main():
     mode    = "move" if args.move else "copy"
     dup_mode = ("SHA-256 only" if args.exact_only
                 else f"SHA-256 + pHash (threshold={args.phash_threshold})")
+    dir_mode = "YYYY/YYYY-MM/" if args.by_month else "YYYY/"
 
     print(f"Source           : {src}")
     print(f"Dest             : {dst}")
     print(f"Mode             : {'DRY RUN' if dry_run else mode.upper()}")
+    print(f"Directory layout : {dir_mode}")
     print(f"Dup detection    : {dup_mode}")
     print(f"Workers          : {args.sha_workers} SHA threads, {args.phash_workers} pHash processes")
     print(f"Cache            : {args.cache}")
@@ -865,6 +876,7 @@ def main():
             sha_workers     = args.sha_workers,
             phash_workers   = args.phash_workers,
             extensions      = extensions,
+            by_month        = args.by_month,
         )
     finally:
         cache.close()
