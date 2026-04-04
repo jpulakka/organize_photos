@@ -7,9 +7,10 @@ organize_photos.py — Sort photos into YYYY/ (or YYYY/YYYY-MM/ with
 
 Date resolution priority:
   1. EXIF DateTimeOriginal  (most accurate — when the shutter fired)
-  2. EXIF DateTime          (file write time, less reliable)
-  3. Filename patterns      (IMG_20231014_..., 2023-10-14_..., 20231014_..., etc.)
-  4. File modification time (last resort)
+  2. EXIF DateTimeDigitized (usually same as above, fallback)
+  3. EXIF DateTime          (file write time, less reliable)
+  4. Filename patterns      (IMG_20231014_..., 2023-10-14_..., 20231014_..., etc.)
+  5. File modification time (last resort)
 
 Duplicate detection (two-stage):
   Stage 1 — exact:       SHA-256 of full content. Identical bytes → duplicate.
