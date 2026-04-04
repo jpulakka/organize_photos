@@ -58,6 +58,7 @@ Dependencies:
 import argparse
 import hashlib
 import multiprocessing
+import os
 import re
 import shutil
 import sqlite3
@@ -650,6 +651,38 @@ def plan(
 # Execution
 # ════════════════════════════════════════════════════════════════════════════════
 
+def _safe_move(src_path: Path, dst_file: Path, expected_hash: "str | None") -> None:
+    """
+    Move a file safely.
+
+    Same-device: uses os.rename (atomic, no data risk).
+    Cross-device: copies, verifies SHA-256 of the copy matches the
+    previously-computed hash, then deletes the source.  If verification
+    fails the source is preserved and an error is raised.
+    """
+    try:
+        os.rename(str(src_path), str(dst_file))
+        return                                      # same-device: atomic rename
+    except OSError:
+        pass                                        # cross-device — copy + verify
+
+    shutil.copy2(str(src_path), dst_file)
+
+    if expected_hash:
+        h = hashlib.sha256()
+        with open(dst_file, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        if h.hexdigest() != expected_hash:
+            dst_file.unlink()
+            raise RuntimeError(
+                "SHA-256 verification failed after cross-device copy — "
+                "source preserved, corrupt copy removed"
+            )
+
+    src_path.unlink()
+
+
 def write_dup_log(dst: Path, dup_pairs: list) -> None:
     log_path = dst / "duplicates.log"
     dst.mkdir(parents=True, exist_ok=True)
@@ -678,7 +711,7 @@ def run(moves: list, dup_pairs: list, dst: Path, mode: str, dry_run: bool) -> No
             try:
                 dst_file.parent.mkdir(parents=True, exist_ok=True)
                 if mode == "move":
-                    shutil.move(str(r.path), dst_file)
+                    _safe_move(r.path, dst_file, r.exact_hash)
                 else:
                     shutil.copy2(str(r.path), dst_file)
                 verb = "MOVE" if mode == "move" else "COPY"
@@ -699,6 +732,11 @@ def run(moves: list, dup_pairs: list, dst: Path, mode: str, dry_run: bool) -> No
     print(f"  └ Mtime only     : {counters.get('mtime', 0)}")
     if failures:
         print(f"  Errors           : {failures} file(s) failed to {mode}")
+    if dup_pairs and mode == "move" and not dry_run:
+        print()
+        print(f"  NOTE: {len(dup_pairs)} duplicate(s) were left in the source directory.")
+        print( "     See duplicates.log in the destination for the full list.")
+        print( "     Exact duplicates (SHA-256 match) are safe to delete.")
     if dry_run:
         print()
         print("  ⚠  DRY RUN — nothing was changed.")
@@ -756,6 +794,25 @@ def main():
     if not src.is_dir():
         print(f"ERROR: source not found: {src}", file=sys.stderr)
         sys.exit(1)
+
+    if src == dst:
+        print("ERROR: source and destination are the same directory.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        dst.relative_to(src)
+        print("ERROR: destination is inside source — files would be re-scanned "
+              "and could be moved in circles. Use a destination outside the "
+              "source tree.", file=sys.stderr)
+        sys.exit(1)
+    except ValueError:
+        pass
+    try:
+        src.relative_to(dst)
+        print("ERROR: source is inside destination. Use separate directory "
+              "trees.", file=sys.stderr)
+        sys.exit(1)
+    except ValueError:
+        pass
 
     extensions = (
         {e if e.startswith(".") else f".{e}" for e in args.extensions}
