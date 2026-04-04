@@ -1,7 +1,7 @@
 # organize_photos
 
 Sorts a messy photo/video collection into tidy `YYYY/` directories (or
-`YYYY/YYYY-MM/` with `--by-month`), with fast parallel hashing and
+`YYYY-MM/` with `--by-month`), with fast parallel hashing and
 two-stage duplicate detection. A persistent SQLite cache makes repeat
 runs near-instant.
 
@@ -49,7 +49,7 @@ python organize_photos.py --src /path/to/messy --dst /path/to/sorted --copy
 # 3. Move files once you are happy with the result
 python organize_photos.py --src /path/to/messy --dst /path/to/sorted --move
 
-# Use YYYY/YYYY-MM/ subdirectories instead of plain YYYY/
+# Use YYYY-MM/ directories instead of plain YYYY/
 python organize_photos.py --src /path/to/messy --dst /path/to/sorted --copy --by-month
 ```
 
@@ -69,17 +69,15 @@ Default (`YYYY/`):
   duplicates.log      ← written after --copy / --move when duplicates exist
 ```
 
-With `--by-month` (`YYYY/YYYY-MM/`):
+With `--by-month` (`YYYY-MM/`):
 
 ```
 /path/to/sorted/
-  2023/
-    2023-10/
-      IMG_20231014_120000.jpg
-      IMG_20231014_130000.jpg
-  2024/
-    2024-06/
-      DSC_0099.JPG
+  2023-10/
+    IMG_20231014_120000.jpg
+    IMG_20231014_130000.jpg
+  2024-06/
+    DSC_0099.JPG
   _unknown/
     old_scan.jpg
   duplicates.log
@@ -93,7 +91,7 @@ With `--by-month` (`YYYY/YYYY-MM/`):
 | `--dst DIR` | *(required)* | Destination root directory |
 | `--copy` | — | Copy files; originals are untouched |
 | `--move` | — | Move files |
-| `--by-month` | off | Organise into `YYYY/YYYY-MM/` instead of `YYYY/` |
+| `--by-month` | off | Organise into `YYYY-MM/` instead of `YYYY/` |
 | `--exact-only` | off | SHA-256 dedup only; skip perceptual hashing |
 | `--phash-threshold N` | `8` | Hamming distance for near-duplicate detection (0 = identical hashes only, 64 = maximum) |
 | `--skip-unknown` | off | Omit files whose date falls back to mtime |

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-organize_photos.py — Sort photos into YYYY/ (or YYYY/YYYY-MM/ with
+organize_photos.py — Sort photos into YYYY/ (or YYYY-MM/ with
                      --by-month) directories by date, with duplicate
                      detection, parallel hashing, and a persistent hash
                      cache so repeat runs are near-instant.
@@ -36,7 +36,7 @@ Usage:
   # Move:
   python organize_photos.py --src /path/to/messy --dst /path/to/sorted --move
 
-  # Organise into YYYY/YYYY-MM/ instead of the default YYYY/:
+  # Organise into YYYY-MM/ instead of the default YYYY/:
   python organize_photos.py --src /path/to/messy --dst /path/to/sorted --copy --by-month
 
   # Exact-only dedup (no imagehash needed, faster):
@@ -648,7 +648,7 @@ def plan(
         if r.date_source == "mtime":
             folder = dst / "_unknown" / r.path.relative_to(src).parent
         elif by_month:
-            folder = dst / str(r.dt.year) / r.dt.strftime("%Y-%m")
+            folder = dst / r.dt.strftime("%Y-%m")
         else:
             folder = dst / str(r.dt.year)
         dest = safe_destination(folder / r.path.name, seen_destinations)
@@ -784,7 +784,7 @@ def main():
     cpu_count = multiprocessing.cpu_count()
 
     parser = argparse.ArgumentParser(
-        description="Organise photos into YYYY/ dirs (or YYYY/YYYY-MM/ with --by-month), deduplicated.",
+        description="Organise photos into YYYY/ dirs (or YYYY-MM/ with --by-month), deduplicated.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -796,7 +796,7 @@ def main():
     g.add_argument("--copy", action="store_true", help="Copy files (originals untouched)")
 
     parser.add_argument("--by-month",         action="store_true",
-                        help="Organise into YYYY/YYYY-MM/ instead of the default YYYY/")
+                        help="Organise into YYYY-MM/ instead of the default YYYY/")
     parser.add_argument("--skip-unknown",    action="store_true",
                         help="Skip files whose date falls back to mtime")
     parser.add_argument("--exact-only",      action="store_true",
@@ -858,7 +858,7 @@ def main():
     mode    = "move" if args.move else "copy"
     dup_mode = ("SHA-256 only" if args.exact_only
                 else f"SHA-256 + pHash (threshold={args.phash_threshold})")
-    dir_mode = "YYYY/YYYY-MM/" if args.by_month else "YYYY/"
+    dir_mode = "YYYY-MM/" if args.by_month else "YYYY/"
 
     print(f"Source           : {src}")
     print(f"Dest             : {dst}")
