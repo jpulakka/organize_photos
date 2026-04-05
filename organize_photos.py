@@ -62,6 +62,7 @@ Dependencies:
 
 import argparse
 import hashlib
+import json
 import multiprocessing
 import os
 import re
@@ -126,6 +127,10 @@ class HashCache:
         PRIMARY KEY (path, size, mtime_ns)
     );
     CREATE INDEX IF NOT EXISTS idx_path ON file_hashes(path);
+    CREATE TABLE IF NOT EXISTS near_dedup_results (
+        fingerprint TEXT PRIMARY KEY,
+        dup_pairs   TEXT
+    );
     """
 
     def __init__(self, db_path: Path):
@@ -184,8 +189,28 @@ class HashCache:
             self._con.commit()
         self._con.close()
 
+    # ── near-dedup result cache ────────────────────────────────────────────────
+
+    def get_near_dedup(self, fingerprint: str) -> "list | None":
+        """Return cached [(kept_path, skipped_path), ...] or None."""
+        row = self._con.execute(
+            "SELECT dup_pairs FROM near_dedup_results WHERE fingerprint=?",
+            (fingerprint,),
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def put_near_dedup(self, fingerprint: str, pairs: list):
+        """Store near-dedup result, replacing any previous entry."""
+        self._con.execute("DELETE FROM near_dedup_results")
+        self._con.execute(
+            "INSERT INTO near_dedup_results(fingerprint, dup_pairs) VALUES (?,?)",
+            (fingerprint, json.dumps(pairs)),
+        )
+        self._con.commit()
+
     def clear(self):
         self._con.execute("DELETE FROM file_hashes")
+        self._con.execute("DELETE FROM near_dedup_results")
         self._con.commit()
         print("  Cache cleared.")
 
@@ -578,13 +603,38 @@ def find_duplicates(
     valid  = [r for r in phashable if r.phash_str]
     failed = [r for r in phashable if not r.phash_str]
 
+    # Fingerprint the input set: same files + same pHashes + same threshold
+    # → deterministic result, so we can skip the BK-tree entirely on repeat.
+    fp = hashlib.sha256(str(phash_threshold).encode())
+    for r in sorted(valid, key=lambda r: str(r.path)):
+        fp.update(str(r.path).encode())
+        fp.update(b'\0')
+        fp.update(r.phash_str.encode())
+        fp.update(b'\0')
+    fingerprint = fp.hexdigest()
+
+    cached = cache.get_near_dedup(fingerprint)
+    if cached is not None:
+        path_to_record = {str(r.path): r for r in valid}
+        near_dup_pairs = []
+        skipped_paths = set()
+        for kept_path, skipped_path in cached:
+            kept = path_to_record.get(kept_path)
+            skipped = path_to_record.get(skipped_path)
+            if kept and skipped:
+                near_dup_pairs.append((kept, skipped))
+                skipped_paths.add(skipped_path)
+        keepers = [r for r in valid if str(r.path) not in skipped_paths]
+        print(f"  Near-duplicates: {len(near_dup_pairs)} (from cache)")
+        return keepers + non_phashable + failed, dup_pairs + near_dup_pairs
+
     tree = BKTree()
     for r in valid:
         tree.add(r)
 
     used = set()
     keepers = []
-    near_dup_count = 0
+    near_dup_pairs = []
 
     bar = _make_progress(len(valid), "Near-dedup query")
     for r in valid:
@@ -604,12 +654,16 @@ def find_duplicates(
         keepers.append(keeper)
         for n in cluster:
             if n is not keeper:
-                dup_pairs.append((keeper, n))
-                near_dup_count += 1
+                near_dup_pairs.append((keeper, n))
     bar.close()
 
-    print(f"  Near-duplicates found:  {near_dup_count}")
-    return keepers + non_phashable + failed, dup_pairs
+    # Cache result so repeat runs skip the BK-tree entirely
+    cache.put_near_dedup(fingerprint,
+                         [(str(k.path), str(s.path))
+                          for k, s in near_dup_pairs])
+
+    print(f"  Near-duplicates found:  {len(near_dup_pairs)}")
+    return keepers + non_phashable + failed, dup_pairs + near_dup_pairs
 
 
 # ════════════════════════════════════════════════════════════════════════════════
