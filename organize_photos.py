@@ -815,6 +815,75 @@ def plan(
 # Execution
 # ════════════════════════════════════════════════════════════════════════════════
 
+EXIF_WRITABLE = {".jpg", ".jpeg"}
+
+
+def _write_exif_date(filepath: Path, dt: datetime) -> bool:
+    """Losslessly inject date into EXIF of a JPEG file.
+
+    Writes DateTimeOriginal, DateTimeDigitized, and DateTime tags by
+    replacing the APP1/Exif segment in the raw JPEG binary — image data
+    is never re-encoded.  Returns True on success, False if skipped or
+    failed (the file is left unchanged on failure).
+    """
+    if filepath.suffix.lower() not in EXIF_WRITABLE:
+        return False
+
+    date_str = dt.strftime("%Y:%m:%d %H:%M:%S")
+
+    try:
+        from PIL import Image
+
+        with Image.open(filepath) as img:
+            exif = img.getexif()
+            exif[306] = date_str                  # DateTime (IFD0)
+            exif_ifd = exif.get_ifd(0x8769)
+            exif_ifd[36867] = date_str            # DateTimeOriginal
+            exif_ifd[36868] = date_str            # DateTimeDigitized
+            exif_bytes = exif.tobytes()
+
+        if not exif_bytes:
+            return False
+
+        data = filepath.read_bytes()
+        if data[:2] != b'\xff\xd8':
+            return False
+
+        # Build new APP1 segment: marker + length + "Exif\x00\x00" + TIFF data
+        app1_body = b'Exif\x00\x00' + exif_bytes
+        app1_seg = (b'\xff\xe1'
+                    + (len(app1_body) + 2).to_bytes(2, 'big')
+                    + app1_body)
+
+        # Parse existing marker segments, keeping everything except old
+        # APP1/Exif.  Other APP1 segments (XMP, etc.) are preserved.
+        pos = 2                                   # skip SOI (FF D8)
+        kept_segments = bytearray()
+        while pos < len(data) - 1:
+            if data[pos] != 0xFF:
+                break
+            marker = data[pos:pos + 2]
+            if marker in (b'\xff\xda', b'\xff\xd9'):
+                break                             # SOS / EOI — end of metadata
+            seg_len = int.from_bytes(data[pos + 2:pos + 4], 'big')
+            is_exif_app1 = (marker == b'\xff\xe1'
+                            and data[pos + 4:pos + 8] == b'Exif')
+            if not is_exif_app1:
+                kept_segments.extend(data[pos:pos + 2 + seg_len])
+            pos += 2 + seg_len
+
+        # Reassemble: SOI + new APP1 + other segments + SOS/image data/EOI
+        out = bytearray(b'\xff\xd8')
+        out.extend(app1_seg)
+        out.extend(kept_segments)
+        out.extend(data[pos:])
+
+        filepath.write_bytes(bytes(out))
+        return True
+    except Exception:
+        return False
+
+
 def _safe_move(src_path: Path, dst_file: Path, expected_hash: "str | None") -> None:
     """
     Move a file safely.
@@ -875,11 +944,12 @@ def write_dup_log(dst: Path, dup_pairs: list, moved_to: "dict[Path, Path] | None
 
 
 def run(moves: list, dup_pairs: list, dst: Path, mode: str, dry_run: bool,
-        skipped_unknown: int = 0) -> None:
+        skipped_unknown: int = 0, exif_write: bool = True) -> None:
     total = len(moves)
     pad = len(str(total))
     counters: dict = {"exif": 0, "filename": 0, "mtime": 0}
     failures = 0
+    exif_written = 0
 
     print()
     for i, (r, dst_file) in enumerate(moves, 1):
@@ -894,8 +964,15 @@ def run(moves: list, dup_pairs: list, dst: Path, mode: str, dry_run: bool,
                     _safe_move(r.path, dst_file, r.exact_hash)
                 else:
                     shutil.copy2(str(r.path), dst_file)
+                # Write resolved date into EXIF of the destination file
+                wrote_exif = False
+                if exif_write and r.date_source != "exif":
+                    wrote_exif = _write_exif_date(dst_file, r.dt)
+                    if wrote_exif:
+                        exif_written += 1
                 verb = "MOVE" if mode == "move" else "COPY"
-                print(f"  {verb} {label}  {r.path.name}  ->  {dst_file}")
+                exif_tag = " +EXIF" if wrote_exif else ""
+                print(f"  {verb} {label}  {r.path.name}  ->  {dst_file}{exif_tag}")
             except Exception as exc:
                 print(f"  FAIL {label}  {r.path.name}: {exc}")
                 failures += 1
@@ -916,6 +993,8 @@ def run(moves: list, dup_pairs: list, dst: Path, mode: str, dry_run: bool,
     print(f"  ├ EXIF date      : {counters.get('exif', 0)}")
     print(f"  ├ Filename date  : {counters.get('filename', 0)}")
     print(f"  └ Mtime only     : {counters.get('mtime', 0)}")
+    if exif_written:
+        print(f"  EXIF written     : {exif_written} file(s) got DateTimeOriginal")
     if failures:
         print(f"  Errors           : {failures} file(s) failed to {mode}")
     if dup_pairs and mode == "move" and not dry_run:
@@ -965,6 +1044,10 @@ def main():
                         help="SQLite cache path (default ~/.cache/organize_photos.db)")
     parser.add_argument("--clear-cache",     action="store_true",
                         help="Wipe the cache before running")
+    parser.add_argument("--no-exif-write",  action="store_true",
+                        help="Don't write resolved date into EXIF of destination "
+                             "JPEG files (default: dates from filename/mtime are "
+                             "written as DateTimeOriginal)")
     parser.add_argument("--extensions",      nargs="+", metavar="EXT",
                         help="Override extensions (e.g. .jpg .png .heic)")
     args = parser.parse_args()
@@ -1017,6 +1100,8 @@ def main():
     print(f"Dest             : {dst}")
     print(f"Mode             : {'DRY RUN' if dry_run else mode.upper()}")
     print(f"Directory layout : {dir_mode}")
+    exif_mode = "off" if args.no_exif_write else "on (write date into EXIF of JPEGs)"
+    print(f"EXIF write       : {exif_mode}")
     print(f"Dup detection    : {dup_mode}")
     print(f"Workers          : {args.sha_workers} SHA threads, {args.phash_workers} pHash processes")
     print(f"Cache            : {args.cache}")
@@ -1045,7 +1130,8 @@ def main():
         return
 
     run(moves, dup_pairs, dst, mode=mode, dry_run=dry_run,
-        skipped_unknown=skipped_unknown)
+        skipped_unknown=skipped_unknown,
+        exif_write=not args.no_exif_write)
 
 
 if __name__ == "__main__":
