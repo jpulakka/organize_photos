@@ -254,6 +254,14 @@ def resolve_date(path: Path) -> "tuple[datetime, str]":
     return mtime_date(path), "mtime"
 
 
+def _scan_file(path_str: str) -> "tuple[str, datetime, str, int, int]":
+    """Worker: resolve date and stat a file.  Runs in a thread."""
+    p = Path(path_str)
+    dt, source = resolve_date(p)
+    st = p.stat()
+    return path_str, dt, source, st.st_size, st.st_mtime_ns
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # Hashing — module-level so ProcessPoolExecutor can pickle them
 # ════════════════════════════════════════════════════════════════════════════════
@@ -285,27 +293,30 @@ def _compute_phash(path_str: str) -> "tuple[str, str | None]":
 
 class FileRecord:
     __slots__ = ("path", "dt", "date_source", "size", "mtime_ns",
-                 "exact_hash", "phash_str")
+                 "exact_hash", "phash_str", "_phash_int")
 
-    def __init__(self, path: Path, dt: datetime, date_source: str):
+    def __init__(self, path: Path, dt: datetime, date_source: str,
+                 size: int, mtime_ns: int):
         self.path = path
         self.dt = dt
         self.date_source = date_source
-        st = path.stat()
-        self.size: int = st.st_size
-        self.mtime_ns: int = st.st_mtime_ns
+        self.size = size
+        self.mtime_ns = mtime_ns
         self.exact_hash: "str | None" = None
-        self.phash_str:  "str | None" = None   # hex string, parsed on demand
+        self.phash_str:  "str | None" = None
+        self._phash_int = None
 
-    def phash_obj(self):
-        """Return imagehash object (lazy parse from hex string)."""
+    @property
+    def phash_int(self) -> "int | None":
+        """Perceptual hash as a plain int (fast Hamming via XOR + popcount)."""
+        v = self._phash_int
+        if v is not None:
+            return v
         if self.phash_str is None:
             return None
-        try:
-            import imagehash
-            return imagehash.hex_to_hash(self.phash_str)
-        except Exception:
-            return None
+        v = int(self.phash_str, 16)
+        self._phash_int = v
+        return v
 
     def rank(self):
         return (DATE_SOURCE_RANK[self.date_source], -self.size)
@@ -443,9 +454,13 @@ def batch_phash(
 
 class BKTree:
     """
-    Burkhard-Keller tree over imagehash Hamming distances.
+    Burkhard-Keller tree for Hamming-distance lookup on perceptual hashes.
 
-    Each node: [hash_obj, FileRecord, children_dict, *exact_dupes]
+    Hashes are stored as plain ints; Hamming distance = popcount(a XOR b).
+    This avoids the overhead of imagehash/numpy objects during the millions
+    of distance computations that happen at tree-build and query time.
+
+    Each node: [hash_int, FileRecord, children_dict, *exact_dupes]
     Children keyed by Hamming distance from this node's hash.
     Triangle inequality prunes subtrees: if a child was inserted at
     distance d, and we query within radius r, only visit that child
@@ -456,7 +471,7 @@ class BKTree:
         self._root = None
 
     def add(self, record: FileRecord):
-        h = record.phash_obj()
+        h = record.phash_int
         if h is None:
             return
         if self._root is None:
@@ -464,7 +479,7 @@ class BKTree:
             return
         node = self._root
         while True:
-            dist = h - node[0]
+            dist = bin(h ^ node[0]).count('1')
             if dist == 0:
                 node.append(record)
                 return
@@ -474,7 +489,7 @@ class BKTree:
                 return
             node = children[dist]
 
-    def find(self, query_hash, threshold: int) -> list:
+    def find(self, query_int: int, threshold: int) -> list:
         if self._root is None:
             return []
         results = []
@@ -483,7 +498,7 @@ class BKTree:
             node = stack.pop()
             node_hash, record, children = node[0], node[1], node[2]
             extra = node[3:]
-            dist = query_hash - node_hash
+            dist = bin(query_int ^ node_hash).count('1')
             if dist <= threshold:
                 results.append(record)
                 results.extend(extra)
@@ -564,18 +579,23 @@ def find_duplicates(
     failed = [r for r in phashable if not r.phash_str]
 
     tree = BKTree()
+    bar = _make_progress(len(valid), "BK-tree build")
     for r in valid:
         tree.add(r)
+        bar.update()
+    bar.close()
 
     used = set()
     keepers = []
     near_dup_count = 0
 
+    bar = _make_progress(len(valid), "Near-dedup query")
     for r in valid:
+        bar.update()
         if id(r) in used:
             continue
         used.add(id(r))
-        qh = r.phash_obj()
+        qh = r.phash_int
         if qh is None:
             keepers.append(r)
             continue
@@ -589,6 +609,7 @@ def find_duplicates(
             if n is not keeper:
                 dup_pairs.append((keeper, n))
                 near_dup_count += 1
+    bar.close()
 
     print(f"  Near-duplicates found:  {near_dup_count}")
     return keepers + non_phashable + failed, dup_pairs
@@ -630,7 +651,22 @@ def plan(
     )
     print(f"  Found {len(all_files)} media files in source.")
 
-    records = [FileRecord(f, *resolve_date(f)) for f in all_files]
+    # Resolve dates in parallel — EXIF reading is I/O-bound and dominates
+    # when done sequentially (minutes for large collections).
+    bar = _make_progress(len(all_files), "Scanning dates")
+    records = []
+    with ThreadPoolExecutor(max_workers=sha_workers) as pool:
+        futures = {pool.submit(_scan_file, str(f)): f for f in all_files}
+        for fut in as_completed(futures):
+            try:
+                path_str, dt, source, size, mtime_ns = fut.result()
+                records.append(FileRecord(Path(path_str), dt, source,
+                                          size, mtime_ns))
+            except Exception as exc:
+                f = futures[fut]
+                print(f"\n  WARNING: scan failed for {f}: {exc}", flush=True)
+            bar.update()
+    bar.close()
 
     keepers, dup_pairs = find_duplicates(
         records, cache, exact_only, phash_threshold, sha_workers, phash_workers,
