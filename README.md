@@ -141,9 +141,10 @@ Use `--extensions` to restrict or extend this list.
 
 ## Performance
 
-The hash cache (SQLite) stores SHA-256 and pHash keyed on
-`(path, size, mtime_ns)`. On repeat runs, unmodified files are served from
-the cache without re-reading.
+The SQLite cache stores SHA-256 hashes, perceptual hashes, and
+near-duplicate query results.  On repeat runs with an unchanged
+collection, all expensive steps — hashing and duplicate detection —
+are served from cache.
 
 ```
 First run  (50 000 photos):  several minutes (dominated by I/O)
