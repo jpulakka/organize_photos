@@ -155,6 +155,10 @@ Use `--extensions` to restrict or extend this list.
   deletes the source if the hash matches
 - **Interrupted copy cleanup** — if a copy is interrupted (disk full, Ctrl+C),
   any partial destination file is removed so future runs start clean
+- **Atomic EXIF writes** — date injection writes to a temp file in the
+  same directory, then does an atomic `os.replace`; the destination file
+  is never partially overwritten (important in `--move` mode where the
+  source is already deleted)
 
 ## Performance
 
