@@ -3,7 +3,7 @@
 Sorts a messy photo/video collection into tidy `YYYY/` directories (or
 `YYYY-MM/` with `--by-month`), with fast parallel hashing and
 two-stage duplicate detection. A persistent SQLite cache makes repeat
-runs near-instant.
+runs much faster.
 
 ```
 before/                          after/
@@ -141,14 +141,16 @@ Use `--extensions` to restrict or extend this list.
 
 ## Performance
 
-The SQLite cache stores SHA-256 hashes, perceptual hashes, and
-near-duplicate query results.  On repeat runs with an unchanged
-collection, all expensive steps — hashing and duplicate detection —
-are served from cache.
+The SQLite cache stores resolved dates, SHA-256 hashes, perceptual
+hashes, and near-duplicate query results.  On repeat runs with an
+unchanged collection, all expensive steps — EXIF reading, hashing,
+and duplicate detection — are served from cache.  The remaining cost
+is file discovery (`rglob`) and `stat` calls, which is seconds to
+a few minutes depending on the filesystem and collection size.
 
 ```
-First run  (50 000 photos):  several minutes (dominated by I/O)
-Repeat run (nothing changed): seconds
+First run  (50 000 photos):  several minutes (dominated by EXIF I/O + hashing)
+Repeat run (nothing changed): seconds to a few minutes (file discovery + stat)
 ```
 
 To move the cache (e.g., to a fast local SSD when the source is a NAS):

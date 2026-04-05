@@ -19,10 +19,12 @@ Duplicate detection (two-stage):
                          Uses a BK-tree for O(n log n) matching.
 
 Performance:
+  - Resolved dates, SHA-256, and pHash all cached in SQLite keyed on
+    (path, size, mtime_ns); repeat runs skip EXIF/hash I/O entirely.
+  - Near-duplicate query results cached too — the slow BK-tree step
+    is skipped when the file set hasn't changed.
   - SHA-256 computed in parallel via ThreadPoolExecutor  (I/O-bound)
   - pHash   computed in parallel via ProcessPoolExecutor (CPU-bound)
-  - Both cached in SQLite keyed on (path, size, mtime_ns); repeat runs
-    skip any file that hasn't changed on disk.
 
 Cache location: ~/.cache/organize_photos.db  (override with --cache)
 
@@ -127,6 +129,14 @@ class HashCache:
         PRIMARY KEY (path, size, mtime_ns)
     );
     CREATE INDEX IF NOT EXISTS idx_path ON file_hashes(path);
+    CREATE TABLE IF NOT EXISTS file_dates (
+        path        TEXT    NOT NULL,
+        size        INTEGER NOT NULL,
+        mtime_ns    INTEGER NOT NULL,
+        date_iso    TEXT    NOT NULL,
+        date_source TEXT    NOT NULL,
+        PRIMARY KEY (path, size, mtime_ns)
+    );
     CREATE TABLE IF NOT EXISTS near_dedup_results (
         fingerprint TEXT PRIMARY KEY,
         dup_pairs   TEXT
@@ -140,7 +150,8 @@ class HashCache:
         self._con.execute("PRAGMA synchronous=NORMAL")
         self._con.executescript(self.SCHEMA)
         self._con.commit()
-        self._pending: list[tuple] = []   # rows to batch-write
+        self._pending: list[tuple] = []        # hash rows to batch-write
+        self._pending_dates: list[tuple] = []  # date rows to batch-write
         self._pending_updates: int = 0
 
     # ── read ─────────────────────────────────────────────────────────────────────
@@ -161,15 +172,25 @@ class HashCache:
             self.flush()
 
     def flush(self):
-        if not self._pending:
-            return
-        self._con.executemany(
-            """INSERT OR REPLACE INTO file_hashes(path, size, mtime_ns, sha256, phash)
-               VALUES (?,?,?,?,?)""",
-            self._pending,
-        )
-        self._con.commit()
-        self._pending.clear()
+        dirty = False
+        if self._pending:
+            self._con.executemany(
+                """INSERT OR REPLACE INTO file_hashes(path, size, mtime_ns, sha256, phash)
+                   VALUES (?,?,?,?,?)""",
+                self._pending,
+            )
+            self._pending.clear()
+            dirty = True
+        if self._pending_dates:
+            self._con.executemany(
+                """INSERT OR REPLACE INTO file_dates(path, size, mtime_ns, date_iso, date_source)
+                   VALUES (?,?,?,?,?)""",
+                self._pending_dates,
+            )
+            self._pending_dates.clear()
+            dirty = True
+        if dirty:
+            self._con.commit()
 
     def update_phash(self, path: Path, size: int, mtime_ns: int, ph: str):
         """Fill in phash for a row that already has sha256 (two-pass scenario)."""
@@ -188,6 +209,26 @@ class HashCache:
         if self._pending_updates:
             self._con.commit()
         self._con.close()
+
+    # ── date cache ───────────────────────────────────────────────────────────
+
+    def load_dates(self) -> dict:
+        """Bulk-load all cached dates into a dict for fast in-memory lookup.
+
+        Returns {(path_str, size, mtime_ns): (date_iso, date_source)}.
+        """
+        result = {}
+        for row in self._con.execute(
+            "SELECT path, size, mtime_ns, date_iso, date_source FROM file_dates"
+        ):
+            result[(row[0], row[1], row[2])] = (row[3], row[4])
+        return result
+
+    def put_date(self, path: Path, size: int, mtime_ns: int,
+                 date_iso: str, date_source: str):
+        self._pending_dates.append((str(path), size, mtime_ns, date_iso, date_source))
+        if len(self._pending_dates) >= CACHE_BATCH:
+            self.flush()
 
     # ── near-dedup result cache ────────────────────────────────────────────────
 
@@ -210,6 +251,7 @@ class HashCache:
 
     def clear(self):
         self._con.execute("DELETE FROM file_hashes")
+        self._con.execute("DELETE FROM file_dates")
         self._con.execute("DELETE FROM near_dedup_results")
         self._con.commit()
         print("  Cache cleared.")
@@ -277,14 +319,6 @@ def resolve_date(path: Path) -> "tuple[datetime, str]":
     if dt:
         return dt, "filename"
     return mtime_date(path), "mtime"
-
-
-def _scan_file(path_str: str) -> "tuple[str, datetime, str, int, int]":
-    """Worker: resolve date and stat a file.  Runs in a thread."""
-    p = Path(path_str)
-    dt, source = resolve_date(p)
-    st = p.stat()
-    return path_str, dt, source, st.st_size, st.st_mtime_ns
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -706,22 +740,50 @@ def plan(
     all_files.sort()
     print(f"\r  Found {len(all_files)} media files in source.          ")
 
-    # Resolve dates in parallel — EXIF reading is I/O-bound and dominates
-    # when done sequentially (minutes for large collections).
-    bar = _make_progress(len(all_files), "Scanning dates")
+    # Resolve dates — check cache first (EXIF reading is the slow part).
+    date_cache = cache.load_dates()
     records = []
-    with ThreadPoolExecutor(max_workers=sha_workers) as pool:
-        futures = {pool.submit(_scan_file, str(f)): f for f in all_files}
-        for fut in as_completed(futures):
+    need_date = []  # (path, size, mtime_ns) not yet cached
+    for f in all_files:
+        try:
+            st = f.stat()
+        except OSError as exc:
+            print(f"  WARNING: cannot stat {f}: {exc}", flush=True)
+            continue
+        key = (str(f), st.st_size, st.st_mtime_ns)
+        cached = date_cache.get(key)
+        if cached:
             try:
-                path_str, dt, source, size, mtime_ns = fut.result()
-                records.append(FileRecord(Path(path_str), dt, source,
-                                          size, mtime_ns))
-            except Exception as exc:
-                f = futures[fut]
-                print(f"\n  WARNING: scan failed for {f}: {exc}", flush=True)
-            bar.update()
-    bar.close()
+                dt = datetime.fromisoformat(cached[0])
+                records.append(FileRecord(f, dt, cached[1],
+                                          st.st_size, st.st_mtime_ns))
+                continue
+            except (ValueError, TypeError):
+                pass  # corrupt cache entry — re-resolve
+        need_date.append((f, st.st_size, st.st_mtime_ns))
+
+    if not need_date:
+        print(f"  Dates: all {len(records)} served from cache.")
+    else:
+        if records:
+            print(f"  Dates: {len(records)} from cache, resolving {len(need_date)}...")
+        bar = _make_progress(len(need_date), "Resolving dates")
+        with ThreadPoolExecutor(max_workers=sha_workers) as pool:
+            futures = {}
+            for f, size, mtime_ns in need_date:
+                futures[pool.submit(resolve_date, f)] = (f, size, mtime_ns)
+            for fut in as_completed(futures):
+                f, size, mtime_ns = futures[fut]
+                try:
+                    dt, source = fut.result()
+                    records.append(FileRecord(f, dt, source, size, mtime_ns))
+                    cache.put_date(f, size, mtime_ns, dt.isoformat(), source)
+                except Exception as exc:
+                    print(f"\n  WARNING: date scan failed for {f}: {exc}",
+                          flush=True)
+                bar.update()
+        bar.close()
+        cache.flush()
 
     keepers, dup_pairs = find_duplicates(
         records, cache, exact_only, phash_threshold, sha_workers, phash_workers,
