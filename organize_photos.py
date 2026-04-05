@@ -2,8 +2,8 @@
 """
 organize_photos.py — Sort photos into YYYY/ (or YYYY-MM/ with
                      --by-month) directories by date, with duplicate
-                     detection, parallel hashing, and a persistent hash
-                     cache so repeat runs are near-instant.
+                     detection, parallel hashing, and a persistent
+                     cache so repeat runs are much faster.
 
 Date resolution priority:
   1. EXIF DateTimeOriginal  (most accurate — when the shutter fired)
@@ -71,6 +71,7 @@ import re
 import shutil
 import sqlite3
 import sys
+import tempfile
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -823,8 +824,15 @@ def _write_exif_date(filepath: Path, dt: datetime) -> bool:
 
     Writes DateTimeOriginal, DateTimeDigitized, and DateTime tags by
     replacing the APP1/Exif segment in the raw JPEG binary — image data
-    is never re-encoded.  Returns True on success, False if skipped or
-    failed (the file is left unchanged on failure).
+    is never re-encoded.
+
+    Safety: builds the new file in memory, writes it to a temp file in
+    the same directory, then does an atomic os.replace.  The original
+    file is never partially overwritten (important in --move mode where
+    the source is already deleted).
+
+    Returns True on success, False if skipped or failed (the file is
+    left unchanged on failure).
     """
     if filepath.suffix.lower() not in EXIF_WRITABLE:
         return False
@@ -878,7 +886,27 @@ def _write_exif_date(filepath: Path, dt: datetime) -> bool:
         out.extend(kept_segments)
         out.extend(data[pos:])
 
-        filepath.write_bytes(bytes(out))
+        # Write to temp file in the same directory, then atomic replace.
+        # This guarantees the original file survives if the write fails
+        # (e.g. disk full) — critical in --move mode where the source
+        # is already deleted.
+        parent = filepath.parent
+        fd, tmp_path = tempfile.mkstemp(
+            suffix=filepath.suffix, dir=parent)
+        try:
+            os.write(fd, bytes(out))
+            os.close(fd)
+            fd = -1                               # mark as closed
+            os.replace(tmp_path, str(filepath))   # atomic on same device
+        except BaseException:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
         return True
     except Exception:
         return False
