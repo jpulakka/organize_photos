@@ -456,7 +456,7 @@ class BKTree:
     """
     Burkhard-Keller tree for Hamming-distance lookup on perceptual hashes.
 
-    Hashes are stored as plain ints; Hamming distance = popcount(a XOR b).
+    Hashes are stored as plain ints; Hamming distance = (a ^ b).bit_count().
     This avoids the overhead of imagehash/numpy objects during the millions
     of distance computations that happen at tree-build and query time.
 
@@ -479,7 +479,7 @@ class BKTree:
             return
         node = self._root
         while True:
-            dist = bin(h ^ node[0]).count('1')
+            dist = (h ^ node[0]).bit_count()
             if dist == 0:
                 node.append(record)
                 return
@@ -498,7 +498,7 @@ class BKTree:
             node = stack.pop()
             node_hash, record, children = node[0], node[1], node[2]
             extra = node[3:]
-            dist = bin(query_int ^ node_hash).count('1')
+            dist = (query_int ^ node_hash).bit_count()
             if dist <= threshold:
                 results.append(record)
                 results.extend(extra)
@@ -579,11 +579,8 @@ def find_duplicates(
     failed = [r for r in phashable if not r.phash_str]
 
     tree = BKTree()
-    bar = _make_progress(len(valid), "BK-tree build")
     for r in valid:
         tree.add(r)
-        bar.update()
-    bar.close()
 
     used = set()
     keepers = []
@@ -645,11 +642,15 @@ def plan(
     by_month: bool = False,
 ) -> "tuple[list, list, int]":
 
-    all_files = sorted(
-        p for p in src.rglob("*")
-        if p.is_file() and p.suffix.lower() in extensions
-    )
-    print(f"  Found {len(all_files)} media files in source.")
+    all_files = []
+    for p in src.rglob("*"):
+        if p.is_file() and p.suffix.lower() in extensions:
+            all_files.append(p)
+            if len(all_files) % 1000 == 0:
+                print(f"\r  Scanning... {len(all_files)} media files found",
+                      end="", flush=True)
+    all_files.sort()
+    print(f"\r  Found {len(all_files)} media files in source.          ")
 
     # Resolve dates in parallel — EXIF reading is I/O-bound and dominates
     # when done sequentially (minutes for large collections).
