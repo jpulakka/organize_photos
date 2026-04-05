@@ -23,6 +23,9 @@ before/                          after/
   catches re-saves, slight crops, and social-media re-uploads
 - **Parallel hashing** — SHA-256 in threads (I/O-bound), pHash in processes
   (CPU-bound)
+- **EXIF date writing** — JPEGs without EXIF dates get `DateTimeOriginal`
+  written losslessly from the resolved date (filename/mtime), so sorted
+  files always carry their date in metadata
 - **Safe moves** — same-device moves use an atomic `os.rename`; cross-device
   moves copy, verify SHA-256, then delete the source
 - **Dry-run by default** — nothing changes until you pass `--copy` or `--move`
@@ -94,6 +97,7 @@ With `--by-month` (`YYYY-MM/`):
 | `--by-month` | off | Organise into `YYYY-MM/` instead of `YYYY/` |
 | `--exact-only` | off | SHA-256 dedup only; skip perceptual hashing |
 | `--phash-threshold N` | `8` | Hamming distance for near-duplicate detection (0 = identical hashes only, 64 = maximum) |
+| `--no-exif-write` | off | Don't write resolved date into EXIF of destination JPEGs (see below) |
 | `--skip-unknown` | off | Omit files whose date falls back to mtime |
 | `--sha-workers N` | `4` | Threads for SHA-256 hashing |
 | `--phash-workers N` | cpu count | Processes for pHash computation |
@@ -117,6 +121,19 @@ With `--move`, duplicate files are left behind in the source directory and
 listed in `duplicates.log` in the destination. Exact duplicates (SHA-256
 match) are safe to delete. Near-duplicates should be reviewed first — they
 may be meaningfully different photos.
+
+## EXIF date writing
+
+When a JPEG file's date was resolved from a filename pattern or file
+modification time (not from EXIF), the tool writes that date into the
+destination file's EXIF `DateTimeOriginal`, `DateTimeDigitized`, and
+`DateTime` tags.  This is done losslessly — the EXIF metadata segment
+is replaced in the raw JPEG binary without re-encoding the image data.
+
+This means sorted files always carry their date in EXIF, making them
+work correctly with any photo viewer or library that reads EXIF dates.
+
+Pass `--no-exif-write` to disable this and copy files byte-for-byte.
 
 ## Supported formats
 
