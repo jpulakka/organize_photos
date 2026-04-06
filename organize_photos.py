@@ -753,6 +753,7 @@ def plan(
     phash_workers: int,
     extensions: "set[str]",
     by_month: bool = False,
+    only_periods: "set[str] | None" = None,
 ) -> "tuple[list, list]":
 
     all_files = []
@@ -800,6 +801,18 @@ def plan(
         print(f"  Dates: {cached_count} from cache, {resolved} resolved.")
     else:
         print(f"  Dates: all {len(records)} served from cache.")
+
+    # Apply --only period filter
+    if only_periods:
+        def _matches(r: FileRecord) -> bool:
+            year_str = str(r.dt.year)
+            month_str = r.dt.strftime("%Y-%m")
+            return year_str in only_periods or month_str in only_periods
+        before = len(records)
+        records = [r for r in records if _matches(r)]
+        filtered = before - len(records)
+        if filtered:
+            print(f"  Filter: {len(records)} files match --only, {filtered} skipped.")
 
     keepers, dup_pairs = find_duplicates(
         records, cache, exact_only, phash_threshold, sha_workers, phash_workers,
@@ -1094,6 +1107,9 @@ def main():
 
     parser.add_argument("--by-month",         action="store_true",
                         help="Organise into YYYY-MM/ instead of the default YYYY/")
+    parser.add_argument("--only",            nargs="+", metavar="PERIOD",
+                        help="Process only files from specific periods, "
+                             "e.g. --only 2023 2024-06")
     parser.add_argument("--exact-only",      action="store_true",
                         help="SHA-256 only; no perceptual hashing")
     parser.add_argument("--phash-threshold", type=int, default=8, metavar="N",
@@ -1156,6 +1172,18 @@ def main():
         if args.extensions else ALL_EXTENSIONS
     )
 
+    # Validate --only periods (YYYY or YYYY-MM)
+    only_periods: "set[str] | None" = None
+    if args.only:
+        only_periods = set()
+        for p in args.only:
+            if re.fullmatch(r"\d{4}", p):
+                only_periods.add(p)
+            elif re.fullmatch(r"\d{4}-\d{2}", p):
+                only_periods.add(p)
+            else:
+                parser.error(f"--only value must be YYYY or YYYY-MM, got: {p!r}")
+
     dry_run = not (args.move or args.copy)
     mode    = "move" if args.move else "copy"
     dup_mode = ("SHA-256 only" if args.exact_only
@@ -1166,6 +1194,8 @@ def main():
     print(f"Dest             : {dst}")
     print(f"Mode             : {'DRY RUN' if dry_run else mode.upper()}")
     print(f"Directory layout : {dir_mode}")
+    if only_periods:
+        print(f"Filter           : {', '.join(sorted(only_periods))}")
     exif_mode = "off" if args.no_exif_write else "on (write date into EXIF of JPEGs)"
     print(f"EXIF write       : {exif_mode}")
     print(f"Dup detection    : {dup_mode}")
@@ -1186,6 +1216,7 @@ def main():
             phash_workers   = args.phash_workers,
             extensions      = extensions,
             by_month        = args.by_month,
+            only_periods    = only_periods,
         )
     finally:
         cache.close()
