@@ -614,7 +614,7 @@ def find_duplicates(
     """
 
     # ── Stage 1 ──────────────────────────────────────────────────────────────────
-    print(f"\n[1/2] Exact dedup (SHA-256)")
+    print(f"\n[2/5] Exact dedup (SHA-256)")
     batch_sha256(records, cache, sha_workers)
 
     by_hash: dict = defaultdict(list)
@@ -642,7 +642,7 @@ def find_duplicates(
         return after_exact, dup_pairs
 
     # ── Stage 2 ──────────────────────────────────────────────────────────────────
-    print(f"\n[2/2] Near-dedup (pHash, threshold={phash_threshold})")
+    print(f"\n[3/5] Near-dedup (pHash, threshold={phash_threshold})")
 
     phashable     = [r for r in after_exact if r.path.suffix.lower() in PHASH_EXTENSIONS]
     non_phashable = [r for r in after_exact if r.path.suffix.lower() not in PHASH_EXTENSIONS]
@@ -688,6 +688,7 @@ def find_duplicates(
         print(f"  Near-duplicates: {len(near_dup_pairs)} (from cache)")
         return keepers + non_phashable + failed, dup_pairs + near_dup_pairs
 
+    print(f"\n[4/5] Near-dedup query")
     tree = BKTree()
     for r in valid:
         tree.add(r)
@@ -771,6 +772,7 @@ def plan(
     date_cache = cache.load_dates()
     records = []
     cached_count = 0
+    print(f"\n[1/5] Scanning dates")
     bar = _make_progress(len(all_files), "Scanning dates")
 
     with ThreadPoolExecutor(max_workers=sha_workers) as pool:
@@ -998,17 +1000,20 @@ def run(moves: list, dup_pairs: list, dst: Path, mode: str, dry_run: bool,
     counters: dict = {"exif": 0, "filename": 0, "mtime": 0}
     failures = 0
     exif_written = 0
-    log_lines: list[str] = []      # collected for moved.log / copied.log
+    log_lines: list[str] = []      # collected for log files
+    verb = "MOVE" if mode == "move" else "COPY"
 
-    print()
+    print(f"\n[5/5] {'DRY RUN' if dry_run else verb.capitalize()}")
     if dry_run:
-        # Dry run always shows per-file output -- that's its purpose.
+        # Build log lines; only print to console with --verbose.
         for i, (r, dst_file) in enumerate(moves, 1):
             counters[r.date_source] = counters.get(r.date_source, 0) + 1
             label = f"[{i:{pad}d}/{total}] ({r.date_source:8s})"
-            print(f"  DRY  {label}  {r.path}  ->  {dst_file}")
+            line = f"  DRY  {label}  {r.path}  ->  {dst_file}"
+            log_lines.append(line)
+            if verbose:
+                print(line)
     else:
-        verb = "MOVE" if mode == "move" else "COPY"
         bar = None if verbose else _make_progress(total, f"{verb.capitalize()}ing")
         for i, (r, dst_file) in enumerate(moves, 1):
             counters[r.date_source] = counters.get(r.date_source, 0) + 1
@@ -1025,7 +1030,7 @@ def run(moves: list, dup_pairs: list, dst: Path, mode: str, dry_run: bool,
                         exif_written += 1
                 exif_tag = " +EXIF" if wrote_exif else ""
                 label = f"[{i:{pad}d}/{total}] ({r.date_source:8s})"
-                line = f"  {verb} {label}  {r.path.name}  ->  {dst_file}{exif_tag}"
+                line = f"  {verb} {label}  {r.path}  ->  {dst_file}{exif_tag}"
                 log_lines.append(line)
                 if verbose:
                     print(line)
@@ -1033,7 +1038,7 @@ def run(moves: list, dup_pairs: list, dst: Path, mode: str, dry_run: bool,
                     bar.update()
             except Exception as exc:
                 label = f"[{i:{pad}d}/{total}] ({r.date_source:8s})"
-                fail_line = f"  FAIL {label}  {r.path.name}: {exc}"
+                fail_line = f"  FAIL {label}  {r.path}: {exc}"
                 log_lines.append(fail_line)
                 print(f"\n{fail_line}", flush=True)
                 if not verbose:
@@ -1049,14 +1054,18 @@ def run(moves: list, dup_pairs: list, dst: Path, mode: str, dry_run: bool,
         except Exception as exc:
             print(f"  WARNING: could not write duplicate log: {exc}")
 
-    # Write operations log (moved.log or copied.log)
-    if not dry_run and log_lines:
+    # Write operations log
+    if log_lines:
         try:
-            log_name = "moved.log" if mode == "move" else "copied.log"
+            if dry_run:
+                log_name = "dry_run.log"
+            else:
+                log_name = "moved.log" if mode == "move" else "copied.log"
             log_path = dst / log_name
             dst.mkdir(parents=True, exist_ok=True)
             with open(log_path, "w", encoding="utf-8") as f:
-                f.write(f"# {verb} log -- {datetime.now():%Y-%m-%d %H:%M:%S}\n")
+                label = "DRY RUN" if dry_run else verb
+                f.write(f"# {label} log -- {datetime.now():%Y-%m-%d %H:%M:%S}\n")
                 f.write(f"# {total} file(s) processed, {failures} failure(s)\n\n")
                 for line in log_lines:
                     f.write(line + "\n")
