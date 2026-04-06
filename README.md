@@ -93,6 +93,7 @@ With `--by-month` (`YYYY-MM/`):
 | `--copy` | — | Copy files; originals are untouched |
 | `--move` | — | Move files |
 | `--by-month` | off | Organise into `YYYY-MM/` instead of `YYYY/` |
+| `--only PERIOD ...` | all | Process only specific periods, e.g. `--only 2023 2024-06` |
 | `--exact-only` | off | SHA-256 dedup only; skip perceptual hashing |
 | `--phash-threshold N` | `8` | Hamming distance for near-duplicate detection (0 = identical hashes only, 64 = maximum) |
 | `--no-exif-write` | off | Don't write resolved date into EXIF of destination JPEGs (see below) |
