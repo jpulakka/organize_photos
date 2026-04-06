@@ -169,8 +169,8 @@ is file discovery (`rglob`) and `stat` calls, which is seconds to
 a few minutes depending on the filesystem and collection size.
 
 ```
-First run  (50 000 photos):  several minutes (dominated by EXIF I/O + hashing)
-Repeat run (nothing changed): seconds to a few minutes (file discovery + stat)
+First run  (50 000 photos): one hour (dominated hashing + dedup) plus copying/moving
+Repeat run (nothing changed): a couple of minutes (file discovery + stat) plus copying/moving
 ```
 
 To move the cache (e.g., to a fast local SSD when the source is a NAS):
