@@ -98,6 +98,7 @@ With `--by-month` (`YYYY-MM/`):
 | `--exact-only` | off | SHA-256 dedup only; skip perceptual hashing |
 | `--phash-threshold N` | `8` | Hamming distance for near-duplicate detection (0 = identical hashes only, 64 = maximum) |
 | `--no-exif-write` | off | Don't write resolved date into EXIF of destination JPEGs (see below) |
+| `-v`, `--verbose` | off | Show per-file output during copy/move (default: progress bar only) |
 | `--skip-unknown` | off | Omit files whose date falls back to mtime |
 | `--sha-workers N` | `4` | Threads for SHA-256 hashing |
 | `--phash-workers N` | cpu count | Processes for pHash computation |
