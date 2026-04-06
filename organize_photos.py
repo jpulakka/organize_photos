@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 """
-organize_photos.py — Sort photos into YYYY/ (or YYYY-MM/ with
+organize_photos.py -- Sort photos into YYYY/ (or YYYY-MM/ with
                      --by-month) directories by date, with duplicate
                      detection, parallel hashing, and a persistent
                      cache so repeat runs are much faster.
 
 Date resolution priority:
-  1. EXIF DateTimeOriginal  (most accurate — when the shutter fired)
+  1. EXIF DateTimeOriginal  (most accurate -- when the shutter fired)
   2. EXIF DateTimeDigitized (usually same as above, fallback)
   3. EXIF DateTime          (file write time, less reliable)
   4. Filename patterns      (IMG_20231014_..., 2023-10-14_..., 20231014_..., etc.)
   5. File modification time (last resort)
 
 Duplicate detection (two-stage):
-  Stage 1 — exact:       SHA-256 of full content. Identical bytes → duplicate.
-  Stage 2 — perceptual:  pHash via imagehash (images only). Hamming distance
+  Stage 1 -- exact:      SHA-256 of full content. Identical bytes = duplicate.
+  Stage 2 -- perceptual:  pHash via imagehash (images only). Hamming distance
                          <= threshold catches re-saves, crops, slight edits.
                          Uses a BK-tree for O(n log n) matching.
 
 Performance:
   - Resolved dates, SHA-256, and pHash all cached in SQLite keyed on
     (path, size, mtime_ns); repeat runs skip EXIF/hash I/O entirely.
-  - Near-duplicate query results cached too — the slow BK-tree step
+  - Near-duplicate query results cached too -- the slow BK-tree step
     is skipped when the file set hasn't changed.
   - SHA-256 computed in parallel via ThreadPoolExecutor  (I/O-bound)
   - pHash   computed in parallel via ProcessPoolExecutor (CPU-bound)
@@ -29,10 +29,10 @@ Performance:
 Cache location: ~/.cache/organize_photos.db  (override with --cache)
 
 Usage:
-  # Dry run — shows what WOULD happen, touches nothing:
+  # Dry run -- shows what WOULD happen, touches nothing:
   python organize_photos.py --src /path/to/messy --dst /path/to/sorted
 
-  # Copy (recommended first run — originals untouched):
+  # Copy (recommended first run -- originals untouched):
   python organize_photos.py --src /path/to/messy --dst /path/to/sorted --copy
 
   # Move:
@@ -59,7 +59,7 @@ Usage:
 Dependencies:
   pip install Pillow       # EXIF + pHash image decoding
   pip install imagehash    # perceptual hashing (skip with --exact-only)
-  pip install tqdm         # optional — nicer progress bars
+  pip install tqdm         # optional -- nicer progress bars
 """
 
 import argparse
@@ -112,7 +112,7 @@ class HashCache:
     """
     Persistent cache of (sha256, phash) keyed on (path, size, mtime_ns).
 
-    Cache key uses nanosecond mtime — any write to the file changes it,
+    Cache key uses nanosecond mtime -- any write to the file changes it,
     so a cache hit guarantees the file hasn't been modified since last run.
 
     Thread-safety: SQLite WAL mode + a single connection owned by the main
@@ -199,7 +199,7 @@ class HashCache:
             "UPDATE file_hashes SET phash=? WHERE path=? AND size=? AND mtime_ns=?",
             (ph, str(path), size, mtime_ns),
         )
-        # Don't commit immediately — will be flushed in next batch or close
+        # Don't commit immediately -- will be flushed in next batch or close
         self._pending_updates += 1
         if self._pending_updates >= CACHE_BATCH:
             self._con.commit()
@@ -322,8 +322,30 @@ def resolve_date(path: Path) -> "tuple[datetime, str]":
     return mtime_date(path), "mtime"
 
 
+def _scan_one_file(path: Path, date_cache: dict) -> "tuple | None":
+    """Worker: stat + cache lookup + resolve_date in one shot.
+
+    Runs in a thread.  Returns (path, dt, source, size, mtime_ns, was_cached)
+    or None if stat fails.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    key = (str(path), st.st_size, st.st_mtime_ns)
+    cached = date_cache.get(key)
+    if cached:
+        try:
+            dt = datetime.fromisoformat(cached[0])
+            return (path, dt, cached[1], st.st_size, st.st_mtime_ns, True)
+        except (ValueError, TypeError):
+            pass
+    dt, source = resolve_date(path)
+    return (path, dt, source, st.st_size, st.st_mtime_ns, False)
+
+
 # ════════════════════════════════════════════════════════════════════════════════
-# Hashing — module-level so ProcessPoolExecutor can pickle them
+# Hashing -- module-level so ProcessPoolExecutor can pickle them
 # ════════════════════════════════════════════════════════════════════════════════
 
 def _compute_sha256(path_str: str) -> "tuple[str, str]":
@@ -411,7 +433,7 @@ def _make_progress(total: int, desc: str):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# Parallel SHA-256 (ThreadPoolExecutor — I/O bound)
+# Parallel SHA-256 (ThreadPoolExecutor -- I/O bound)
 # ════════════════════════════════════════════════════════════════════════════════
 
 def batch_sha256(
@@ -450,7 +472,7 @@ def batch_sha256(
                 continue
             r = path_to_record[path_str]
             r.exact_hash = digest
-            # Write to cache (phash unknown yet — will be filled in batch_phash)
+            # Write to cache (phash unknown yet -- will be filled in batch_phash)
             cache.put(r.path, r.size, r.mtime_ns, digest, None)
             bar.update()
 
@@ -459,7 +481,7 @@ def batch_sha256(
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# Parallel pHash (ProcessPoolExecutor — CPU bound)
+# Parallel pHash (ProcessPoolExecutor -- CPU bound)
 # ════════════════════════════════════════════════════════════════════════════════
 
 def batch_phash(
@@ -554,19 +576,22 @@ class BKTree:
             return []
         results = []
         stack = [self._root]
+        _bit_count = int.bit_count
+        _append = stack.append
         while stack:
             node = stack.pop()
-            node_hash, record, children = node[0], node[1], node[2]
-            extra = node[3:]
-            dist = (query_int ^ node_hash).bit_count()
+            node_hash = node[0]
+            dist = _bit_count(query_int ^ node_hash)
             if dist <= threshold:
-                results.append(record)
-                results.extend(extra)
+                results.append(node[1])
+                # Exact pHash dupes stored at node[3:]
+                for i in range(3, len(node)):
+                    results.append(node[i])
             lo = dist - threshold
             hi = dist + threshold
-            for edge, child in children.items():
+            for edge, child in node[2].items():
                 if lo <= edge <= hi:
-                    stack.append(child)
+                    _append(child)
         return results
 
 
@@ -584,8 +609,8 @@ def find_duplicates(
 ) -> "tuple[list, list]":
     """
     Returns (keepers, dup_pairs).
-    Stage 1 — SHA-256 exact dedup.
-    Stage 2 — pHash near-dedup via BK-tree.
+    Stage 1 -- SHA-256 exact dedup.
+    Stage 2 -- pHash near-dedup via BK-tree.
     """
 
     # ── Stage 1 ──────────────────────────────────────────────────────────────────
@@ -601,7 +626,7 @@ def find_duplicates(
             unhashed.append(r)
 
     dup_pairs = []
-    after_exact = list(unhashed)  # can't dedup without a hash — keep them all
+    after_exact = list(unhashed)  # can't dedup without a hash -- keep them all
     exact_dup_count = 0
     for group in by_hash.values():
         keeper = best_in_group(group)
@@ -629,7 +654,7 @@ def find_duplicates(
     try:
         import imagehash  # noqa: F401
     except ImportError:
-        print("  [imagehash not installed — skipping perceptual check]")
+        print("  [imagehash not installed -- skipping perceptual check]")
         print("  Install with:  pip install imagehash")
         return after_exact, dup_pairs
 
@@ -639,7 +664,7 @@ def find_duplicates(
     failed = [r for r in phashable if not r.phash_str]
 
     # Fingerprint the input set: same files + same pHashes + same threshold
-    # → deterministic result, so we can skip the BK-tree entirely on repeat.
+    # => deterministic result, so we can skip the BK-tree entirely on repeat.
     fp = hashlib.sha256(str(phash_threshold).encode())
     for r in sorted(valid, key=lambda r: str(r.path)):
         fp.update(str(r.path).encode())
@@ -741,50 +766,41 @@ def plan(
     all_files.sort()
     print(f"\r  Found {len(all_files)} media files in source.          ")
 
-    # Resolve dates — check cache first (EXIF reading is the slow part).
+    # Resolve dates -- stat + cache check + resolve_date in one parallel pass.
+    # This avoids the sequential stat loop that was a bottleneck on slow I/O.
     date_cache = cache.load_dates()
     records = []
-    need_date = []  # (path, size, mtime_ns) not yet cached
-    for f in all_files:
-        try:
-            st = f.stat()
-        except OSError as exc:
-            print(f"  WARNING: cannot stat {f}: {exc}", flush=True)
-            continue
-        key = (str(f), st.st_size, st.st_mtime_ns)
-        cached = date_cache.get(key)
-        if cached:
-            try:
-                dt = datetime.fromisoformat(cached[0])
-                records.append(FileRecord(f, dt, cached[1],
-                                          st.st_size, st.st_mtime_ns))
-                continue
-            except (ValueError, TypeError):
-                pass  # corrupt cache entry — re-resolve
-        need_date.append((f, st.st_size, st.st_mtime_ns))
+    cached_count = 0
+    bar = _make_progress(len(all_files), "Scanning dates")
 
-    if not need_date:
-        print(f"  Dates: all {len(records)} served from cache.")
+    with ThreadPoolExecutor(max_workers=sha_workers) as pool:
+        futures = {pool.submit(_scan_one_file, f, date_cache): f
+                   for f in all_files}
+        for fut in as_completed(futures):
+            bar.update()
+            f = futures[fut]
+            try:
+                result = fut.result()
+            except Exception as exc:
+                print(f"\n  WARNING: date scan failed for {f}: {exc}",
+                      flush=True)
+                continue
+            if result is None:
+                continue
+            path, dt, source, size, mtime_ns, was_cached = result
+            records.append(FileRecord(path, dt, source, size, mtime_ns))
+            if was_cached:
+                cached_count += 1
+            else:
+                cache.put_date(path, size, mtime_ns, dt.isoformat(), source)
+
+    bar.close()
+    cache.flush()
+    resolved = len(records) - cached_count
+    if resolved:
+        print(f"  Dates: {cached_count} from cache, {resolved} resolved.")
     else:
-        if records:
-            print(f"  Dates: {len(records)} from cache, resolving {len(need_date)}...")
-        bar = _make_progress(len(need_date), "Resolving dates")
-        with ThreadPoolExecutor(max_workers=sha_workers) as pool:
-            futures = {}
-            for f, size, mtime_ns in need_date:
-                futures[pool.submit(resolve_date, f)] = (f, size, mtime_ns)
-            for fut in as_completed(futures):
-                f, size, mtime_ns = futures[fut]
-                try:
-                    dt, source = fut.result()
-                    records.append(FileRecord(f, dt, source, size, mtime_ns))
-                    cache.put_date(f, size, mtime_ns, dt.isoformat(), source)
-                except Exception as exc:
-                    print(f"\n  WARNING: date scan failed for {f}: {exc}",
-                          flush=True)
-                bar.update()
-        bar.close()
-        cache.flush()
+        print(f"  Dates: all {len(records)} served from cache.")
 
     keepers, dup_pairs = find_duplicates(
         records, cache, exact_only, phash_threshold, sha_workers, phash_workers,
@@ -823,7 +839,7 @@ def _write_exif_date(filepath: Path, dt: datetime) -> bool:
     """Losslessly inject date into EXIF of a JPEG file.
 
     Writes DateTimeOriginal, DateTimeDigitized, and DateTime tags by
-    replacing the APP1/Exif segment in the raw JPEG binary — image data
+    replacing the APP1/Exif segment in the raw JPEG binary -- image data
     is never re-encoded.
 
     Safety: builds the new file in memory, writes it to a temp file in
@@ -872,7 +888,7 @@ def _write_exif_date(filepath: Path, dt: datetime) -> bool:
                 break
             marker = data[pos:pos + 2]
             if marker in (b'\xff\xda', b'\xff\xd9'):
-                break                             # SOS / EOI — end of metadata
+                break                             # SOS / EOI -- end of metadata
             seg_len = int.from_bytes(data[pos + 2:pos + 4], 'big')
             is_exif_app1 = (marker == b'\xff\xe1'
                             and data[pos + 4:pos + 8] == b'Exif')
@@ -888,7 +904,7 @@ def _write_exif_date(filepath: Path, dt: datetime) -> bool:
 
         # Write to temp file in the same directory, then atomic replace.
         # This guarantees the original file survives if the write fails
-        # (e.g. disk full) — critical in --move mode where the source
+        # (e.g. disk full) -- critical in --move mode where the source
         # is already deleted.
         parent = filepath.parent
         fd, tmp_path = tempfile.mkstemp(
@@ -925,7 +941,7 @@ def _safe_move(src_path: Path, dst_file: Path, expected_hash: "str | None") -> N
         os.rename(str(src_path), str(dst_file))
         return                                      # same-device: atomic rename
     except OSError:
-        pass                                        # cross-device — copy + verify
+        pass                                        # cross-device -- copy + verify
 
     try:
         shutil.copy2(str(src_path), dst_file)
@@ -948,7 +964,7 @@ def _safe_move(src_path: Path, dst_file: Path, expected_hash: "str | None") -> N
         if h.hexdigest() != expected_hash:
             dst_file.unlink()
             raise RuntimeError(
-                "SHA-256 verification failed after cross-device copy — "
+                "SHA-256 verification failed after cross-device copy -- "
                 "source preserved, corrupt copy removed"
             )
 
@@ -959,7 +975,7 @@ def write_dup_log(dst: Path, dup_pairs: list, moved_to: "dict[Path, Path] | None
     log_path = dst / "duplicates.log"
     dst.mkdir(parents=True, exist_ok=True)
     with open(log_path, "w", encoding="utf-8") as f:
-        f.write(f"# Duplicate report — {datetime.now():%Y-%m-%d %H:%M:%S}\n")
+        f.write(f"# Duplicate report -- {datetime.now():%Y-%m-%d %H:%M:%S}\n")
         f.write(f"# {len(dup_pairs)} file(s) skipped as duplicates\n\n")
         for kept, skipped in dup_pairs:
             dest = moved_to.get(kept.path) if moved_to else None
@@ -972,7 +988,8 @@ def write_dup_log(dst: Path, dup_pairs: list, moved_to: "dict[Path, Path] | None
 
 
 def run(moves: list, dup_pairs: list, dst: Path, mode: str, dry_run: bool,
-        skipped_unknown: int = 0, exif_write: bool = True) -> None:
+        skipped_unknown: int = 0, exif_write: bool = True,
+        verbose: bool = False) -> None:
     total = len(moves)
     pad = len(str(total))
     counters: dict = {"exif": 0, "filename": 0, "mtime": 0}
@@ -980,30 +997,42 @@ def run(moves: list, dup_pairs: list, dst: Path, mode: str, dry_run: bool,
     exif_written = 0
 
     print()
-    for i, (r, dst_file) in enumerate(moves, 1):
-        counters[r.date_source] = counters.get(r.date_source, 0) + 1
-        label = f"[{i:{pad}d}/{total}] ({r.date_source:8s})"
-        if dry_run:
+    if dry_run:
+        # Dry run always shows per-file output -- that's its purpose.
+        for i, (r, dst_file) in enumerate(moves, 1):
+            counters[r.date_source] = counters.get(r.date_source, 0) + 1
+            label = f"[{i:{pad}d}/{total}] ({r.date_source:8s})"
             print(f"  DRY  {label}  {r.path}  ->  {dst_file}")
-        else:
+    else:
+        verb = "MOVE" if mode == "move" else "COPY"
+        bar = None if verbose else _make_progress(total, f"{verb.capitalize()}ing")
+        for i, (r, dst_file) in enumerate(moves, 1):
+            counters[r.date_source] = counters.get(r.date_source, 0) + 1
             try:
                 dst_file.parent.mkdir(parents=True, exist_ok=True)
                 if mode == "move":
                     _safe_move(r.path, dst_file, r.exact_hash)
                 else:
                     shutil.copy2(str(r.path), dst_file)
-                # Write resolved date into EXIF of the destination file
                 wrote_exif = False
                 if exif_write and r.date_source != "exif":
                     wrote_exif = _write_exif_date(dst_file, r.dt)
                     if wrote_exif:
                         exif_written += 1
-                verb = "MOVE" if mode == "move" else "COPY"
-                exif_tag = " +EXIF" if wrote_exif else ""
-                print(f"  {verb} {label}  {r.path.name}  ->  {dst_file}{exif_tag}")
+                if verbose:
+                    label = f"[{i:{pad}d}/{total}] ({r.date_source:8s})"
+                    exif_tag = " +EXIF" if wrote_exif else ""
+                    print(f"  {verb} {label}  {r.path.name}  ->  {dst_file}{exif_tag}")
+                else:
+                    bar.update()
             except Exception as exc:
-                print(f"  FAIL {label}  {r.path.name}: {exc}")
+                label = f"[{i:{pad}d}/{total}] ({r.date_source:8s})"
+                print(f"\n  FAIL {label}  {r.path.name}: {exc}", flush=True)
+                if not verbose:
+                    bar.update()
                 failures += 1
+        if bar is not None:
+            bar.close()
 
     if not dry_run and dup_pairs:
         try:
@@ -1013,14 +1042,14 @@ def run(moves: list, dup_pairs: list, dst: Path, mode: str, dry_run: bool,
             print(f"  WARNING: could not write duplicate log: {exc}")
 
     print()
-    print("── Summary ─────────────────────────────────────────────")
+    print("-- Summary -------------------------------------------------")
     print(f"  Files kept       : {total}")
     print(f"  Duplicates skip  : {len(dup_pairs)}")
     if skipped_unknown:
         print(f"  Unknown date skip: {skipped_unknown} (--skip-unknown)")
-    print(f"  ├ EXIF date      : {counters.get('exif', 0)}")
-    print(f"  ├ Filename date  : {counters.get('filename', 0)}")
-    print(f"  └ Mtime only     : {counters.get('mtime', 0)}")
+    print(f"    EXIF date      : {counters.get('exif', 0)}")
+    print(f"    Filename date  : {counters.get('filename', 0)}")
+    print(f"    Mtime only     : {counters.get('mtime', 0)}")
     if exif_written:
         print(f"  EXIF written     : {exif_written} file(s) got DateTimeOriginal")
     if failures:
@@ -1032,7 +1061,7 @@ def run(moves: list, dup_pairs: list, dst: Path, mode: str, dry_run: bool,
         print( "     Exact duplicates (SHA-256 match) are safe to delete.")
     if dry_run:
         print()
-        print("  ⚠  DRY RUN — nothing was changed.")
+        print("  ** DRY RUN -- nothing was changed.")
         print("     Re-run with --move or --copy to apply.")
 
 
@@ -1060,7 +1089,7 @@ def main():
     parser.add_argument("--skip-unknown",    action="store_true",
                         help="Skip files whose date falls back to mtime")
     parser.add_argument("--exact-only",      action="store_true",
-                        help="SHA-256 only — no perceptual hashing")
+                        help="SHA-256 only; no perceptual hashing")
     parser.add_argument("--phash-threshold", type=int, default=8, metavar="N",
                         help="Hamming distance for near-duplicates (default 8, range 0-64)")
     parser.add_argument("--sha-workers",     type=int, default=4, metavar="N",
@@ -1076,6 +1105,9 @@ def main():
                         help="Don't write resolved date into EXIF of destination "
                              "JPEG files (default: dates from filename/mtime are "
                              "written as DateTimeOriginal)")
+    parser.add_argument("-v", "--verbose",  action="store_true",
+                        help="Show per-file output during copy/move "
+                             "(default: progress bar only)")
     parser.add_argument("--extensions",      nargs="+", metavar="EXT",
                         help="Override extensions (e.g. .jpg .png .heic)")
     args = parser.parse_args()
@@ -1099,7 +1131,7 @@ def main():
         sys.exit(1)
     try:
         dst.relative_to(src)
-        print("ERROR: destination is inside source — files would be re-scanned "
+        print("ERROR: destination is inside source -- files would be re-scanned "
               "and could be moved in circles. Use a destination outside the "
               "source tree.", file=sys.stderr)
         sys.exit(1)
@@ -1159,7 +1191,8 @@ def main():
 
     run(moves, dup_pairs, dst, mode=mode, dry_run=dry_run,
         skipped_unknown=skipped_unknown,
-        exif_write=not args.no_exif_write)
+        exif_write=not args.no_exif_write,
+        verbose=args.verbose)
 
 
 if __name__ == "__main__":
