@@ -1108,8 +1108,9 @@ def main():
     parser.add_argument("--by-month",         action="store_true",
                         help="Organise into YYYY-MM/ instead of the default YYYY/")
     parser.add_argument("--only",            nargs="+", metavar="PERIOD",
-                        help="Process only files from specific periods, "
-                             "e.g. --only 2023 2024-06")
+                        help="Process only specific periods: YYYY, YYYY-MM, "
+                             "YYYY-YYYY range, YYYY-MM:YYYY-MM range. "
+                             "E.g. --only 2005-2015 2024-06")
     parser.add_argument("--exact-only",      action="store_true",
                         help="SHA-256 only; no perceptual hashing")
     parser.add_argument("--phash-threshold", type=int, default=8, metavar="N",
@@ -1172,7 +1173,7 @@ def main():
         if args.extensions else ALL_EXTENSIONS
     )
 
-    # Validate --only periods (YYYY or YYYY-MM)
+    # Validate --only periods (YYYY, YYYY-MM, YYYY-YYYY range, YYYY-MM:YYYY-MM range)
     only_periods: "set[str] | None" = None
     if args.only:
         only_periods = set()
@@ -1181,8 +1182,33 @@ def main():
                 only_periods.add(p)
             elif re.fullmatch(r"\d{4}-\d{2}", p):
                 only_periods.add(p)
+            elif m := re.fullmatch(r"(\d{4})-(\d{4})", p):
+                y1, y2 = int(m.group(1)), int(m.group(2))
+                if y1 > y2:
+                    parser.error(f"--only year range start > end: {p!r}")
+                for y in range(y1, y2 + 1):
+                    only_periods.add(str(y))
+            elif m := re.fullmatch(r"(\d{4}-\d{2}):(\d{4}-\d{2})", p):
+                try:
+                    d1 = datetime.strptime(m.group(1), "%Y-%m")
+                    d2 = datetime.strptime(m.group(2), "%Y-%m")
+                except ValueError:
+                    parser.error(f"--only invalid month range: {p!r}")
+                if d1 > d2:
+                    parser.error(f"--only month range start > end: {p!r}")
+                cur = d1
+                while cur <= d2:
+                    only_periods.add(cur.strftime("%Y-%m"))
+                    # Advance to next month
+                    if cur.month == 12:
+                        cur = cur.replace(year=cur.year + 1, month=1)
+                    else:
+                        cur = cur.replace(month=cur.month + 1)
             else:
-                parser.error(f"--only value must be YYYY or YYYY-MM, got: {p!r}")
+                parser.error(
+                    f"--only value must be YYYY, YYYY-MM, YYYY-YYYY, "
+                    f"or YYYY-MM:YYYY-MM, got: {p!r}"
+                )
 
     dry_run = not (args.move or args.copy)
     mode    = "move" if args.move else "copy"
