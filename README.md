@@ -10,7 +10,7 @@ before/                          after/
   IMG_20231014_120000.jpg    →   2023/IMG_20231014_120000.jpg
   DSC_0042.JPG               →   2021/DSC_0042.JPG
   copy of DSC_0042.JPG       →   (duplicate — skipped, logged)
-  random_name.jpg            →   _unknown/random_name.jpg
+  random_name.jpg            →   2019/random_name.jpg  (from mtime)
 ```
 
 ## Features
@@ -67,9 +67,8 @@ Default (`YYYY/`):
     IMG_20231014_130000.jpg
   2024/
     DSC_0099.JPG
-  _unknown/           ← files whose date could only be guessed from mtime
-    old_scan.jpg
   duplicates.log      ← written after --copy / --move when duplicates exist
+  copied.log          ← log of all operations (or moved.log with --move)
 ```
 
 With `--by-month` (`YYYY-MM/`):
@@ -81,9 +80,8 @@ With `--by-month` (`YYYY-MM/`):
     IMG_20231014_130000.jpg
   2024-06/
     DSC_0099.JPG
-  _unknown/
-    old_scan.jpg
   duplicates.log
+  moved.log
 ```
 
 ## Options
@@ -99,7 +97,6 @@ With `--by-month` (`YYYY-MM/`):
 | `--phash-threshold N` | `8` | Hamming distance for near-duplicate detection (0 = identical hashes only, 64 = maximum) |
 | `--no-exif-write` | off | Don't write resolved date into EXIF of destination JPEGs (see below) |
 | `-v`, `--verbose` | off | Show per-file output during copy/move (default: progress bar only) |
-| `--skip-unknown` | off | Omit files whose date falls back to mtime |
 | `--sha-workers N` | `4` | Threads for SHA-256 hashing |
 | `--phash-workers N` | cpu count | Processes for pHash computation |
 | `--cache PATH` | `~/.cache/organize_photos.db` | SQLite cache location |

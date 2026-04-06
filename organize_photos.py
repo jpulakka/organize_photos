@@ -747,14 +747,13 @@ def plan(
     src: Path,
     dst: Path,
     cache: HashCache,
-    skip_unknown: bool,
     exact_only: bool,
     phash_threshold: int,
     sha_workers: int,
     phash_workers: int,
     extensions: "set[str]",
     by_month: bool = False,
-) -> "tuple[list, list, int]":
+) -> "tuple[list, list]":
 
     all_files = []
     for p in src.rglob("*"):
@@ -806,18 +805,10 @@ def plan(
         records, cache, exact_only, phash_threshold, sha_workers, phash_workers,
     )
 
-    skipped_unknown = 0
-    if skip_unknown:
-        before = len(keepers)
-        keepers = [r for r in keepers if r.date_source != "mtime"]
-        skipped_unknown = before - len(keepers)
-
     seen_destinations: set = set()
     moves = []
     for r in sorted(keepers, key=lambda r: r.path):
-        if r.date_source == "mtime":
-            folder = dst / "_unknown" / r.path.relative_to(src).parent
-        elif by_month:
+        if by_month:
             folder = dst / r.dt.strftime("%Y-%m")
         else:
             folder = dst / str(r.dt.year)
@@ -825,7 +816,7 @@ def plan(
         seen_destinations.add(dest)
         moves.append((r, dest))
 
-    return moves, dup_pairs, skipped_unknown
+    return moves, dup_pairs
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -988,13 +979,13 @@ def write_dup_log(dst: Path, dup_pairs: list, moved_to: "dict[Path, Path] | None
 
 
 def run(moves: list, dup_pairs: list, dst: Path, mode: str, dry_run: bool,
-        skipped_unknown: int = 0, exif_write: bool = True,
-        verbose: bool = False) -> None:
+        exif_write: bool = True, verbose: bool = False) -> None:
     total = len(moves)
     pad = len(str(total))
     counters: dict = {"exif": 0, "filename": 0, "mtime": 0}
     failures = 0
     exif_written = 0
+    log_lines: list[str] = []      # collected for moved.log / copied.log
 
     print()
     if dry_run:
@@ -1019,15 +1010,19 @@ def run(moves: list, dup_pairs: list, dst: Path, mode: str, dry_run: bool,
                     wrote_exif = _write_exif_date(dst_file, r.dt)
                     if wrote_exif:
                         exif_written += 1
+                exif_tag = " +EXIF" if wrote_exif else ""
+                label = f"[{i:{pad}d}/{total}] ({r.date_source:8s})"
+                line = f"  {verb} {label}  {r.path.name}  ->  {dst_file}{exif_tag}"
+                log_lines.append(line)
                 if verbose:
-                    label = f"[{i:{pad}d}/{total}] ({r.date_source:8s})"
-                    exif_tag = " +EXIF" if wrote_exif else ""
-                    print(f"  {verb} {label}  {r.path.name}  ->  {dst_file}{exif_tag}")
+                    print(line)
                 else:
                     bar.update()
             except Exception as exc:
                 label = f"[{i:{pad}d}/{total}] ({r.date_source:8s})"
-                print(f"\n  FAIL {label}  {r.path.name}: {exc}", flush=True)
+                fail_line = f"  FAIL {label}  {r.path.name}: {exc}"
+                log_lines.append(fail_line)
+                print(f"\n{fail_line}", flush=True)
                 if not verbose:
                     bar.update()
                 failures += 1
@@ -1041,12 +1036,25 @@ def run(moves: list, dup_pairs: list, dst: Path, mode: str, dry_run: bool,
         except Exception as exc:
             print(f"  WARNING: could not write duplicate log: {exc}")
 
+    # Write operations log (moved.log or copied.log)
+    if not dry_run and log_lines:
+        try:
+            log_name = "moved.log" if mode == "move" else "copied.log"
+            log_path = dst / log_name
+            dst.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write(f"# {verb} log -- {datetime.now():%Y-%m-%d %H:%M:%S}\n")
+                f.write(f"# {total} file(s) processed, {failures} failure(s)\n\n")
+                for line in log_lines:
+                    f.write(line + "\n")
+            print(f"  Operations log written: {log_path}")
+        except Exception as exc:
+            print(f"  WARNING: could not write operations log: {exc}")
+
     print()
     print("-- Summary -------------------------------------------------")
     print(f"  Files kept       : {total}")
     print(f"  Duplicates skip  : {len(dup_pairs)}")
-    if skipped_unknown:
-        print(f"  Unknown date skip: {skipped_unknown} (--skip-unknown)")
     print(f"    EXIF date      : {counters.get('exif', 0)}")
     print(f"    Filename date  : {counters.get('filename', 0)}")
     print(f"    Mtime only     : {counters.get('mtime', 0)}")
@@ -1086,8 +1094,6 @@ def main():
 
     parser.add_argument("--by-month",         action="store_true",
                         help="Organise into YYYY-MM/ instead of the default YYYY/")
-    parser.add_argument("--skip-unknown",    action="store_true",
-                        help="Skip files whose date falls back to mtime")
     parser.add_argument("--exact-only",      action="store_true",
                         help="SHA-256 only; no perceptual hashing")
     parser.add_argument("--phash-threshold", type=int, default=8, metavar="N",
@@ -1172,9 +1178,8 @@ def main():
         cache.clear()
 
     try:
-        moves, dup_pairs, skipped_unknown = plan(
+        moves, dup_pairs = plan(
             src, dst, cache,
-            skip_unknown    = args.skip_unknown,
             exact_only      = args.exact_only,
             phash_threshold = args.phash_threshold,
             sha_workers     = args.sha_workers,
@@ -1190,7 +1195,6 @@ def main():
         return
 
     run(moves, dup_pairs, dst, mode=mode, dry_run=dry_run,
-        skipped_unknown=skipped_unknown,
         exif_write=not args.no_exif_write,
         verbose=args.verbose)
 
