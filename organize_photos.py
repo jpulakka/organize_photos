@@ -70,6 +70,7 @@ import os
 import re
 import shutil
 import sqlite3
+import struct
 import sys
 import tempfile
 from collections import defaultdict
@@ -841,20 +842,80 @@ def plan(
 EXIF_WRITABLE = {".jpg", ".jpeg"}
 
 
+def _build_exif_app1(date_str: str, existing_tiff: "bytes | None") -> bytes:
+    """Build an APP1 body (starting with Exif\\x00\\x00) containing date tags.
+
+    If existing_tiff is supplied (raw TIFF bytes from an existing APP1 segment,
+    with the Exif\\x00\\x00 prefix already stripped), Pillow is used to read
+    the existing tags and the three date tags are updated/added.
+
+    If there is no existing EXIF, a minimal but spec-correct TIFF is built
+    from scratch with:
+      IFD0       : DateTime (306)
+      ExifIFD    : DateTimeOriginal (36867), DateTimeDigitized (36868)
+    All three point to the same 20-byte ASCII string.
+    """
+    date_bytes = date_str.encode("ascii") + b"\x00"   # 20 bytes
+
+    if existing_tiff is not None:
+        # Use Pillow to preserve existing tags (GPS, camera info, etc.)
+        # and add the date tags on top.
+        try:
+            from PIL import Image
+            import io
+            # Wrap the raw TIFF bytes in a minimal JPEG so Pillow can open it
+            # as an Exif object — easier than fighting TiffImagePlugin directly.
+            with Image.open(io.BytesIO(b'\xff\xd8\xff\xe1'
+                                       + (len(existing_tiff) + 8).to_bytes(2, 'big')
+                                       + b'Exif\x00\x00'
+                                       + existing_tiff
+                                       + b'\xff\xda')) as img:
+                exif = img.getexif()
+            exif[306]  = date_str                     # DateTime (IFD0)
+            exif_ifd   = exif.get_ifd(0x8769)
+            exif_ifd[36867] = date_str                # DateTimeOriginal
+            exif_ifd[36868] = date_str                # DateTimeDigitized
+            app1_body = exif.tobytes()                # already includes Exif\x00\x00
+            if not app1_body.startswith(b'Exif\x00\x00'):
+                app1_body = b'Exif\x00\x00' + app1_body
+            return app1_body
+        except Exception:
+            pass   # fall through to minimal builder
+
+    # Minimal spec-correct TIFF (little-endian):
+    #   Offset  0 : TIFF header (8 bytes)
+    #   Offset  8 : IFD0 — 2 entries (2 + 2*12 + 4 = 30 bytes) → ends at 38
+    #   Offset 38 : ExifIFD — 2 entries (2 + 2*12 + 4 = 30 bytes) → ends at 68
+    #   Offset 68 : date string (20 bytes)
+    EXIF_IFD_OFS = 38
+    DATE_OFS     = 68
+    tiff = (
+        b"II\x2A\x00" + struct.pack("<I", 8)           # TIFF LE header, IFD0 at 8
+        + struct.pack("<H", 2)                          # IFD0: 2 entries
+        + struct.pack("<HHII", 0x0132, 2, 20, DATE_OFS)        # DateTime
+        + struct.pack("<HHII", 0x8769, 4, 1, EXIF_IFD_OFS)    # ExifIFD pointer
+        + struct.pack("<I", 0)                          # IFD0 next = none
+        + struct.pack("<H", 2)                          # ExifIFD: 2 entries
+        + struct.pack("<HHII", 0x9003, 2, 20, DATE_OFS)        # DateTimeOriginal
+        + struct.pack("<HHII", 0x9004, 2, 20, DATE_OFS)        # DateTimeDigitized
+        + struct.pack("<I", 0)                          # ExifIFD next = none
+        + date_bytes
+    )
+    return b"Exif\x00\x00" + tiff
+
+
 def _write_exif_date(filepath: Path, dt: datetime) -> bool:
     """Losslessly inject date into EXIF of a JPEG file.
 
-    Writes DateTimeOriginal, DateTimeDigitized, and DateTime tags by
-    replacing the APP1/Exif segment in the raw JPEG binary -- image data
-    is never re-encoded.
+    Writes DateTime (IFD0), DateTimeOriginal and DateTimeDigitized (ExifIFD)
+    by replacing the APP1/Exif segment in the raw JPEG binary -- the image
+    data is never re-encoded.
 
-    Safety: builds the new file in memory, writes it to a temp file in
-    the same directory, then does an atomic os.replace.  The original
-    file is never partially overwritten (important in --move mode where
-    the source is already deleted).
+    Safety: assembles the new file in memory, writes it to a temp file in
+    the same directory, then does an atomic os.replace.  The original file
+    is never partially overwritten (critical in --move mode).
 
-    Returns True on success, False if skipped or failed (the file is
-    left unchanged on failure).
+    Returns True on success, False if skipped or failed (file unchanged).
     """
     if filepath.suffix.lower() not in EXIF_WRITABLE:
         return False
@@ -862,33 +923,14 @@ def _write_exif_date(filepath: Path, dt: datetime) -> bool:
     date_str = dt.strftime("%Y:%m:%d %H:%M:%S")
 
     try:
-        from PIL import Image
-
-        with Image.open(filepath) as img:
-            exif = img.getexif()
-            exif[306] = date_str                  # DateTime (IFD0)
-            exif_ifd = exif.get_ifd(0x8769)
-            exif_ifd[36867] = date_str            # DateTimeOriginal
-            exif_ifd[36868] = date_str            # DateTimeDigitized
-            exif_bytes = exif.tobytes()
-
-        if not exif_bytes:
-            return False
-
         data = filepath.read_bytes()
         if data[:2] != b'\xff\xd8':
             return False
 
-        # Build new APP1 segment: marker + length + "Exif\x00\x00" + TIFF data
-        app1_body = b'Exif\x00\x00' + exif_bytes
-        app1_seg = (b'\xff\xe1'
-                    + (len(app1_body) + 2).to_bytes(2, 'big')
-                    + app1_body)
-
-        # Parse existing marker segments, keeping everything except old
-        # APP1/Exif.  Other APP1 segments (XMP, etc.) are preserved.
+        # Walk JPEG segments: strip any existing APP1/Exif, keep everything else.
         pos = 2                                   # skip SOI (FF D8)
         kept_segments = bytearray()
+        existing_tiff: "bytes | None" = None     # raw TIFF bytes (no Exif\x00\x00)
         while pos < len(data) - 1:
             if data[pos] != 0xFF:
                 break
@@ -897,10 +939,19 @@ def _write_exif_date(filepath: Path, dt: datetime) -> bool:
                 break                             # SOS / EOI -- end of metadata
             seg_len = int.from_bytes(data[pos + 2:pos + 4], 'big')
             is_exif_app1 = (marker == b'\xff\xe1'
-                            and data[pos + 4:pos + 8] == b'Exif')
-            if not is_exif_app1:
+                            and data[pos + 4:pos + 10] == b'Exif\x00\x00')
+            if is_exif_app1:
+                # Save the raw TIFF data (skip the 6-byte "Exif\x00\x00" prefix)
+                existing_tiff = bytes(data[pos + 10 : pos + 2 + seg_len])
+            else:
                 kept_segments.extend(data[pos:pos + 2 + seg_len])
             pos += 2 + seg_len
+
+        # Build the new APP1 body and segment
+        app1_body = _build_exif_app1(date_str, existing_tiff)
+        app1_seg = (b'\xff\xe1'
+                    + (len(app1_body) + 2).to_bytes(2, 'big')
+                    + app1_body)
 
         # Reassemble: SOI + new APP1 + other segments + SOS/image data/EOI
         out = bytearray(b'\xff\xd8')
@@ -908,18 +959,14 @@ def _write_exif_date(filepath: Path, dt: datetime) -> bool:
         out.extend(kept_segments)
         out.extend(data[pos:])
 
-        # Write to temp file in the same directory, then atomic replace.
-        # This guarantees the original file survives if the write fails
-        # (e.g. disk full) -- critical in --move mode where the source
-        # is already deleted.
+        # Atomic write via temp file in the same directory.
         parent = filepath.parent
-        fd, tmp_path = tempfile.mkstemp(
-            suffix=filepath.suffix, dir=parent)
+        fd, tmp_path = tempfile.mkstemp(suffix=filepath.suffix, dir=parent)
         try:
             os.write(fd, bytes(out))
             os.close(fd)
-            fd = -1                               # mark as closed
-            os.replace(tmp_path, str(filepath))   # atomic on same device
+            fd = -1
+            os.replace(tmp_path, str(filepath))
         except BaseException:
             if fd >= 0:
                 os.close(fd)
