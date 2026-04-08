@@ -107,14 +107,22 @@ With `--by-month` (`YYYY-MM/`):
 ## Duplicate detection explained
 
 **Stage 1 — exact (always on)**
-Files with identical SHA-256 digests are duplicates. The "best" copy is
-kept — EXIF-dated files beat filename-dated files beat mtime-dated files;
-ties go to the larger file (thumbnails and previews lose).
+Files with identical SHA-256 digests are duplicates. Since the bytes are
+identical, every copy is equally valid as the keeper — but their *paths*
+may resolve to different dates. The copy whose path yields the best date
+source wins: EXIF-dated beats filename-dated beats mtime-dated. (For
+example, two byte-identical JPEGs at `IMG_20231014_120000.jpg` and
+`copy.jpg` will pick the first, since its filename gives a confident
+date.) The other paths are recorded as duplicates.
 
 **Stage 2 — perceptual (skipped with `--exact-only`)**
 Images are perceptually hashed (pHash). Pairs within `--phash-threshold`
-Hamming distance are near-duplicates. A BK-tree makes this O(n log n).
-The same "best copy" rule picks the keeper.
+Hamming distance are near-duplicates — visually similar but not
+byte-identical (re-saves, slight crops, social-media re-uploads). A
+BK-tree makes this O(n log n). The keeper is picked the same way, with
+one extra tie-breaker: when two near-duplicates share the same date
+source, the larger file wins, so thumbnails and previews lose to the
+full-resolution original.
 
 With `--move`, duplicate files are left behind in the source directory and
 listed in `duplicates.log` in the destination. Exact duplicates (SHA-256
